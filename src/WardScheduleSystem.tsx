@@ -228,9 +228,11 @@ interface ScheduleVersion {
 // メインコンポーネント
 // ============================================
 
-const HcuScheduleSystem = ({ department = 'HCU', onBack }: { department?: 'HCU' | 'ER'; onBack?: () => void }) => {
-  const departmentName = department === 'ER' ? '救急外来' : 'HCU';
-  const dbPrefix = department === 'ER' ? 'emergency' : 'hcu';
+const WardScheduleSystem = () => {
+  const department = 'OPD';
+  const onBack = undefined;
+  const departmentName = '外来';
+  const dbPrefix = 'outpatient';
   const {
     t: getTableName, fetchNursesFromDB, upsertNurseToDB, deleteNurseFromDB,
     fetchRequestsFromDB, upsertRequestToDB, deleteRequestFromDB,
@@ -6569,4 +6571,4 @@ const HcuScheduleSystem = ({ department = 'HCU', onBack }: { department?: 'HCU' 
   );
 };
 
-export default HcuScheduleSystem;
+export default WardScheduleSystem;

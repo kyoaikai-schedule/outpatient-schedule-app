@@ -2,7 +2,7 @@
 
 ## プロジェクト概要
 
-HCU + 救急外来 勤務表作成システム（React + TypeScript + Vite + Supabase + Vercel）
+外来 勤務表作成システム（React + TypeScript + Vite + Supabase + Vercel）
 
 ## 技術スタック
 
@@ -24,13 +24,15 @@ npx tsc --noEmit # 型チェックのみ
 
 ```
 src/
-  HcuScheduleSystem.tsx   # HCU勤務表システム（約5,175行）★メイン
-  NurseScheduleSystem.tsx  # 救急外来勤務表システム
-  App.tsx                  # ルーティング（部門選択）
+  WardScheduleSystem.tsx   # 外来勤務表システム（メイン）
+  App.tsx                  # WardScheduleSystemを直接レンダリング
   lib/supabase.ts          # Supabase クライアント
 ```
 
-## HcuScheduleSystem.tsx の構造
+## WardScheduleSystem.tsx の構造
+
+- departmentName: '外来'
+- dbPrefix: 'outpatient'（テーブル名: outpatient_nurses, outpatient_schedules 等）
 
 ### generateSchedule 関数（自動生成アルゴリズム）
 
@@ -74,7 +76,7 @@ isLocked(nurseId, day) → boolean
 - **前月データ（prevMonthConstraints）は絶対に上書きしない** → isLocked() でガード
 - セルに書き込む前は必ず `!isLocked(n.id, d)` をチェック
 
-### HCU 制約条件
+### 外来 制約条件
 
 | 制約 | 値 | 備考 |
 |---|---|---|
