@@ -16,6 +16,17 @@ const POSITIONS = {
   一般: { name: '一般', color: 'bg-slate-100 text-slate-600 border-slate-200', priority: 4 }
 };
 
+// 職種（position＝役職とは別の軸）
+const DEFAULT_JOB_TYPE = '看護師';
+const JOB_TYPES: Record<string, { name: string; color: string }> = {
+  看護師: { name: '看護師', color: 'bg-blue-100 text-blue-700 border-blue-200' },
+  視能訓練士: { name: '視能訓練士', color: 'bg-teal-100 text-teal-700 border-teal-200' },
+  ケアワーカー: { name: 'ケアワーカー', color: 'bg-lime-100 text-lime-700 border-lime-200' },
+};
+// job_type は DB 上 nullable のため、未設定は「看護師」として扱う
+const getJobType = (nurse: { job_type?: string | null } | null | undefined): string =>
+  nurse?.job_type || DEFAULT_JOB_TYPE;
+
 type CustomShift = {
   symbol: string;
   name: string;
@@ -349,7 +360,7 @@ const WardScheduleSystem = () => {
   // ドラッグ&ドロップ並び替え用（表示のみの一時状態。DB構造には影響しない）
   const [draggingNurseId, setDraggingNurseId] = useState<number | null>(null); // ドラッグ中の行
   const [dragOverNurseId, setDragOverNurseId] = useState<number | null>(null); // ドロップ先ハイライト対象
-  const [newNurseData, setNewNurseData] = useState({ name: '', position: '一般' });
+  const [newNurseData, setNewNurseData] = useState({ name: '', position: '一般', job_type: DEFAULT_JOB_TYPE });
   const [editingCell, setEditingCell] = useState<{ nurseId: number; dayIndex: number; x: number; y: number } | null>(null);
   const [generating, setGenerating] = useState(false);
   const [generatingPhase, setGeneratingPhase] = useState('');
@@ -472,7 +483,8 @@ const WardScheduleSystem = () => {
         setIsLoading(true);
         const dbNurses = await fetchNursesFromDB();
         if (dbNurses.length > 0) {
-          setNurses(dbNurses);
+          // job_type 未設定（既存データ / null）は「看護師」として扱う
+          setNurses(dbNurses.map((n: any) => ({ ...n, job_type: getJobType(n) })));
         }
         const dbRequests = await fetchRequestsFromDB(targetYear, targetMonth);
         const reqMap: Record<string, any> = {};
@@ -1095,13 +1107,14 @@ const WardScheduleSystem = () => {
       id: newId,
       name: newNurseData.name.trim(),
       position: newNurseData.position,
+      job_type: newNurseData.job_type || DEFAULT_JOB_TYPE,
       active: true,
       display_order: maxOrder + 1
     };
     setNurses([...nurses, newNurse]);
     saveWithStatus(async () => { await upsertNurseToDB(newNurse); });
     setShowAddNurse(false);
-    setNewNurseData({ name: '', position: '一般' });
+    setNewNurseData({ name: '', position: '一般', job_type: DEFAULT_JOB_TYPE });
   };
 
   const moveNurse = async (nurseId: number, direction: 'up' | 'down') => {
@@ -1258,7 +1271,8 @@ const WardScheduleSystem = () => {
         id: index + 1,
         name: item.name,
         active: true,
-        position: position
+        position: position,
+        job_type: DEFAULT_JOB_TYPE
       };
     });
 
@@ -3823,6 +3837,7 @@ const WardScheduleSystem = () => {
                       <th className="border p-2 text-center w-16">順序</th>
                       <th className="border p-2 text-left">氏名</th>
                       <th className="border p-2 text-center">役職</th>
+                      <th className="border p-2 text-center">職種</th>
                       <th className="border p-2 text-center">夜勤チーム</th>
                       <th className="border p-2 text-center">操作</th>
                     </tr>
@@ -3869,6 +3884,17 @@ const WardScheduleSystem = () => {
                           )}
                         </td>
                         <td className="border p-2 text-center">
+                          {editingNurse === nurse.id ? (
+                            <select defaultValue={getJobType(nurse)} id={`dash-job-${nurse.id}`} className="px-2 py-1 border rounded">
+                              {Object.keys(JOB_TYPES).map(job => (
+                                <option key={job} value={job}>{job}</option>
+                              ))}
+                            </select>
+                          ) : (
+                            <span className={`text-xs px-2 py-1 rounded ${JOB_TYPES[getJobType(nurse)]?.color}`}>{getJobType(nurse)}</span>
+                          )}
+                        </td>
+                        <td className="border p-2 text-center">
                           <select
                             value={nurse.team ?? ''}
                             onChange={(e) => {
@@ -3891,7 +3917,8 @@ const WardScheduleSystem = () => {
                               <button onClick={() => {
                                 const name = (document.getElementById(`dash-name-${nurse.id}`) as HTMLInputElement).value;
                                 const position = (document.getElementById(`dash-pos-${nurse.id}`) as HTMLSelectElement).value;
-                                updateNurse(nurse.id, { name, position });
+                                const job_type = (document.getElementById(`dash-job-${nurse.id}`) as HTMLSelectElement).value;
+                                updateNurse(nurse.id, { name, position, job_type });
                                 setEditingNurse(null);
                               }} className="px-2 py-1 bg-emerald-500 text-white rounded text-xs"><Save size={14} /></button>
                               <button onClick={() => setEditingNurse(null)} className="px-2 py-1 bg-gray-300 rounded text-xs"><X size={14} /></button>
@@ -4483,12 +4510,24 @@ const WardScheduleSystem = () => {
                     ))}
                   </select>
                 </div>
+                <div>
+                  <label className="block text-sm font-medium mb-1">職種</label>
+                  <select
+                    value={newNurseData.job_type}
+                    onChange={(e) => setNewNurseData({ ...newNurseData, job_type: e.target.value })}
+                    className="w-full px-3 py-2 border-2 rounded-lg focus:border-indigo-500 focus:outline-none"
+                  >
+                    {Object.keys(JOB_TYPES).map(job => (
+                      <option key={job} value={job}>{job}</option>
+                    ))}
+                  </select>
+                </div>
               </div>
               <div className="flex gap-3">
                 <button
                   onClick={() => {
                     setShowAddNurse(false);
-                    setNewNurseData({ name: '', position: '一般' });
+                    setNewNurseData({ name: '', position: '一般', job_type: DEFAULT_JOB_TYPE });
                   }}
                   className="flex-1 px-4 py-2 bg-gray-200 hover:bg-gray-300 rounded-lg transition-colors"
                 >
@@ -5706,6 +5745,15 @@ const WardScheduleSystem = () => {
                           <option key={pos} value={pos}>{pos}</option>
                         ))}
                       </select>
+                      <select
+                        defaultValue={getJobType(nurse)}
+                        className="px-2 py-1 border rounded"
+                        id={`edit-job-${nurse.id}`}
+                      >
+                        {Object.keys(JOB_TYPES).map(job => (
+                          <option key={job} value={job}>{job}</option>
+                        ))}
+                      </select>
                       <button
                         type="button"
                         onClick={(e) => {
@@ -5713,7 +5761,8 @@ const WardScheduleSystem = () => {
                           e.stopPropagation();
                           const name = (document.getElementById(`edit-name-${nurse.id}`) as HTMLInputElement).value;
                           const position = (document.getElementById(`edit-pos-${nurse.id}`) as HTMLSelectElement).value;
-                          updateNurse(nurse.id, { name, position });
+                          const job_type = (document.getElementById(`edit-job-${nurse.id}`) as HTMLSelectElement).value;
+                          updateNurse(nurse.id, { name, position, job_type });
                           setEditingNurse(null);
                         }}
                         className="p-1 text-emerald-600 hover:text-emerald-800 cursor-pointer"
@@ -5738,6 +5787,9 @@ const WardScheduleSystem = () => {
                         <span className="text-gray-400 text-xs tabular-nums w-6 text-right">{idx + 1}</span>
                         <span className={`text-xs px-2 py-1 rounded-lg border ${POSITIONS[nurse.position]?.color}`}>
                           {nurse.position}
+                        </span>
+                        <span className={`text-xs px-2 py-1 rounded-lg border ${JOB_TYPES[getJobType(nurse)]?.color}`}>
+                          {getJobType(nurse)}
                         </span>
                         <span className="font-medium">{nurse.name}</span>
                         <select
@@ -7101,12 +7153,24 @@ const WardScheduleSystem = () => {
                     ))}
                   </select>
                 </div>
+                <div>
+                  <label className="block text-sm font-medium mb-1">職種</label>
+                  <select
+                    value={newNurseData.job_type}
+                    onChange={(e) => setNewNurseData({ ...newNurseData, job_type: e.target.value })}
+                    className="w-full px-3 py-2 border-2 rounded-lg focus:border-indigo-500 focus:outline-none"
+                  >
+                    {Object.keys(JOB_TYPES).map(job => (
+                      <option key={job} value={job}>{job}</option>
+                    ))}
+                  </select>
+                </div>
               </div>
               <div className="flex gap-3">
                 <button
                   onClick={() => {
                     setShowAddNurse(false);
-                    setNewNurseData({ name: '', position: '一般' });
+                    setNewNurseData({ name: '', position: '一般', job_type: DEFAULT_JOB_TYPE });
                   }}
                   className="flex-1 px-4 py-2 bg-gray-200 hover:bg-gray-300 rounded-lg transition-colors"
                 >
