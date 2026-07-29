@@ -1699,8 +1699,15 @@ const WardScheduleSystem = () => {
   // CWS勤務表の記号を内部シフトへ変換する。
   // 戻り値: { shift, unmapped }。unmapped=true は未対応記号（警告に記録し、日勤として扱う）。
   //
-  // 判定順序は外来の実データ33種をCWS自身の集計行と突き合わせて決めたもの。順序を変えないこと:
-  //   ﾊ/ﾊ（完全一致・休）は ﾈ の部分一致より先、ｹ の部分一致は ﾈ より先に判定する。
+  // ★記号の一覧表ではなく一般規則で判定する。
+  //   CWSの凡例には特定月に出現しない記号（ﾀ2/ﾈ, ﾈ/ﾀ2, ﾀ2/ｹ, ｹ/ﾀ2, ﾄ で始まる特休系,
+  //   P53/P56/P64 等）が多数あり、一覧表方式では将来必ず取りこぼすため。
+  //
+  //   '/' を含む記号 … 前後に分割し、各半分が ﾊ / ﾈ / ｹ / ﾄ で始まれば「非勤務」、
+  //                    それ以外（空欄・ﾀN・その他）は「勤務」と判定する。
+  //                    どちらか一方でも勤務なら日勤。両方非勤務なら ﾈ を含めば有、なければ休。
+  //                    例: /ﾈ は前半が空欄＝勤務のため日勤（CWSの集計行も日勤として数えている）
+  //   '/' を含まない記号 … 下記の個別規則で判定する。
   const normalizeCwsShift = (raw): { shift: string; unmapped: boolean } => {
     const s = String(raw ?? '').trim();
     if (!s) return { shift: '', unmapped: false };
@@ -1710,24 +1717,31 @@ const WardScheduleSystem = () => {
     const known = normalizeShift(s);
     if (known) return { shift: known, unmapped: false };
 
-    if (s === '公') return { shift: '休', unmapped: false };        // 1
-    if (s === '欠') return { shift: '休', unmapped: false };        // 2
-    if (s === '年') return { shift: '有', unmapped: false };        // 3
-    if (s === '管準') return { shift: '管夜', unmapped: false };    // 4  管理準夜
-    if (s === '管深') return { shift: '管明', unmapped: false };    // 5  管理深夜
-    if (s === '準') return { shift: '夜', unmapped: false };        // 6  準夜勤
-    if (s === '深') return { shift: '明', unmapped: false };        // 7  深夜勤
-    if (s === 'ﾊ/ﾊ') return { shift: '休', unmapped: false };       // 8  ★必ず ﾈ 判定より先
-    if (s.includes('ｹ')) return { shift: '休', unmapped: false };   // 9  ﾊ/ｹ 等（意味は師長に確認中）
-    if (s.includes('ﾈ')) return { shift: '有', unmapped: false };   // 10 ★ﾊ/ﾊ の後
-    if (s.startsWith('短')) return { shift: '日', unmapped: false }; // 11 時短
-    if (s.startsWith('P')) return { shift: '日', unmapped: false };  // 12 パート
-    if (s.startsWith('ﾀ')) return { shift: '日', unmapped: false };  // 13
-    if (s === '・') return { shift: '日', unmapped: false };        // 14 通常日勤
-    if (s === '/ﾊ') return { shift: '日', unmapped: false };        // 15 半休（勤務あり）
-    if (s === 'ﾊ/') return { shift: '日', unmapped: false };        // 16 半休（勤務あり）
+    // 半休・時間休の組み合わせ記号は前後の半分ごとに勤務／非勤務を判定する
+    const slash = s.indexOf('/');
+    if (slash !== -1) {
+      // ﾊ=半休 ﾈ=年休 ｹ=欠勤系 ﾄ=特休。これらで始まる半分は非勤務。空欄・ﾀN 等は勤務。
+      const isNonWorking = (half: string) => /^[ﾊﾈｹﾄ]/.test(half);
+      const worked = !isNonWorking(s.slice(0, slash)) || !isNonWorking(s.slice(slash + 1));
+      if (worked) return { shift: '日', unmapped: false };
+      return { shift: s.includes('ﾈ') ? '有' : '休', unmapped: false };
+    }
 
-    return { shift: '日', unmapped: true };                         // 17 未対応記号
+    if (s === '公') return { shift: '休', unmapped: false };
+    if (s === '欠') return { shift: '休', unmapped: false };
+    if (s === '年') return { shift: '有', unmapped: false };
+    if (s === '・') return { shift: '日', unmapped: false };
+    if (s === '管準') return { shift: '管夜', unmapped: false };    // 管理準夜
+    if (s === '管深') return { shift: '管明', unmapped: false };    // 管理深夜
+    if (s === '準') return { shift: '夜', unmapped: false };        // 準夜勤
+    if (s === '深') return { shift: '明', unmapped: false };        // 深夜勤
+    if (s.startsWith('短')) return { shift: '日', unmapped: false }; // 時短
+    if (s.startsWith('P')) return { shift: '日', unmapped: false };  // パート
+    if (s.startsWith('ﾀ')) return { shift: '日', unmapped: false };
+    if (s.includes('ﾈ')) return { shift: '有', unmapped: false };   // 6.5ﾈ, ﾈ4.0 等
+    if (s.includes('ﾄ')) return { shift: '休', unmapped: false };   // ﾄ4.0 等（特休）
+
+    return { shift: '日', unmapped: true };                         // 未対応記号
   };
 
   // 変換後データの夜勤パターン整合性チェック（警告のみ。取り込みは中断しない）。
