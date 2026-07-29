@@ -89,6 +89,21 @@ const CUSTOM_SHIFT_EXCEL_COLORS: Record<string, { bg: string; fg: string }> = {
 };
 
 const VALID_SHIFTS = ['日', '夜', '明', '管夜', '管明', '休', '有', '午前半', '午後半'];
+
+// solver.py の _build_forced.apply() が処理できる希望ラベル。
+// apply() には else 節がないため、ここに無いラベルは黙って無視される（サイレント失敗）。
+const SOLVER_APPLICABLE_SHIFTS = ['管夜', '管明', '明', '夜', '日', '休', '有'];
+
+// 半休の希望ラベル → ソルバー送信値。
+// ソルバーは DAY / NIGHT / OFF の3値モデルで半休の概念を持たないため、
+// 半休は「日勤1名」としてソルバーへ送る（CWSの集計行も午後半休の職員を日勤1名として数える）。
+// 送信値は '日' だが、生成結果の表示時には元のラベルへ復元する。
+const HALF_DAY_REQUEST_SHIFTS: Record<string, string> = {
+  '前': '日',
+  '後': '日',
+  '午前半': '日',
+  '午後半': '日',
+};
 const sanitizeShift = (s: any): string | null => {
   if (!s) return null;
   const str = String(s).trim();
@@ -1794,11 +1809,34 @@ const WardScheduleSystem = () => {
       };
     });
 
+    // === 希望ラベルをソルバーが解釈できる形へ変換して送る ===
+    // 半休（前 / 後 / 午前半 / 午後半）は solver.py の apply() が処理できず黙って無視されるため、
+    // 「日勤1名」として '日' に変換して送信する。表示側では getHalfDayRestoreMap() で元に戻す。
     const requestData: Record<string, Record<string, string>> = {};
+    const unknownLabels = new Set<string>();
     generationNurses.forEach(n => {
       const nr = requests[monthKey]?.[String(n.id)] || {};
-      if (Object.keys(nr).length > 0) requestData[String(n.id)] = nr as Record<string, string>;
+      if (Object.keys(nr).length === 0) return;
+      const converted: Record<string, string> = {};
+      Object.entries(nr).forEach(([day, label]) => {
+        const v = label as string;
+        const mapped = typeof v === 'string' ? HALF_DAY_REQUEST_SHIFTS[v] : undefined;
+        if (mapped) {
+          converted[day] = mapped;
+        } else {
+          converted[day] = v;
+          // apply() が処理できない未知のラベルはサイレント失敗の再発防止のため記録する
+          if (typeof v === 'string' && v && !SOLVER_APPLICABLE_SHIFTS.includes(v)) unknownLabels.add(v);
+        }
+      });
+      requestData[String(n.id)] = converted;
     });
+    if (unknownLabels.size > 0) {
+      console.warn(
+        '[buildSolverRequest] ソルバーが解釈できない希望ラベルが含まれています（これらの希望は無視されます）:',
+        Array.from(unknownLabels)
+      );
+    }
 
     // 年度切り替え対策: 現在のスタッフリストに存在しない ID の prevMonthConstraints は除外
     // (前月在籍で当月不在のスタッフが残っているとソルバーが警告するため)
@@ -1850,6 +1888,23 @@ const WardScheduleSystem = () => {
     }
 
     return request;
+  };
+
+  // 半休希望の復元マップ { nurseId: { 0-based日index: 元のラベル } }
+  // buildSolverRequest が '日' に変換して送った半休希望を、生成結果の表示時に元のラベルへ戻すために使う。
+  const getHalfDayRestoreMap = (): Record<string, Record<number, string>> => {
+    const monthKey = `${targetYear}-${targetMonth}`;
+    const map: Record<string, Record<number, string>> = {};
+    Object.entries(requests[monthKey] || {}).forEach(([nid, days]: [string, any]) => {
+      Object.entries(days || {}).forEach(([day, label]) => {
+        // requests のキーは1-based、ソルバー結果の配列は0-based
+        if (typeof label === 'string' && HALF_DAY_REQUEST_SHIFTS[label]) {
+          if (!map[nid]) map[nid] = {};
+          map[nid][Number(day) - 1] = label;
+        }
+      });
+    });
+    return map;
   };
 
   // 勤務表自動生成（マルチフェーズ制約最適化 + 焼きなまし法）
@@ -1911,10 +1966,21 @@ const WardScheduleSystem = () => {
 
         // API結果をフロントエンド形式に変換
         const excludedNurses = activeNurses.filter(n => nurseShiftPrefs[n.id]?.excludeFromGeneration);
+        // '日' として送った半休希望を元のラベル（前 / 後 / 午前半 / 午後半）へ復元する
+        const halfDayRestore = getHalfDayRestoreMap();
         const patterns = result.patterns.map((p: any, idx: number) => {
           const data: Record<number, string[]> = {};
           Object.entries(p.data).forEach(([nid, shifts]: [string, any]) => {
-            data[Number(nid)] = shifts;
+            const arr = Array.isArray(shifts) ? [...shifts] : shifts;
+            const restore = halfDayRestore[String(nid)];
+            if (restore && Array.isArray(arr)) {
+              Object.entries(restore).forEach(([dayIdx, label]) => {
+                const i = Number(dayIdx);
+                // ソルバーが希望どおり日勤を置いた場合のみ復元する（他シフトは上書きしない）
+                if (i >= 0 && i < arr.length && arr[i] === '日') arr[i] = label;
+              });
+            }
+            data[Number(nid)] = arr;
           });
           excludedNurses.forEach(n => {
             data[n.id] = new Array(daysInMonth).fill(null);
