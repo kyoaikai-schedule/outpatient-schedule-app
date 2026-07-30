@@ -261,13 +261,13 @@ const getNthMonday = (y: number, mo: number, n: number): number => {
 
 // 基礎となる祝日（振替休日・国民の休日を含まない）を年単位で列挙する。
 // 戻り値は [月(1-based), 日] の配列。
-// ※ 建国記念の日(2/11) は元の実装から列挙されていない。追加は未承認のため現状を維持している。
 const getBaseHolidays = (year: number): Array<[number, number]> => {
   const spring = Math.floor(20.8431 + 0.242194 * (year - 1980) - Math.floor((year - 1980) / 4));
   const autumn = Math.floor(23.2488 + 0.242194 * (year - 1980) - Math.floor((year - 1980) / 4));
   return [
     [1, 1],                              // 元日
     [1, getNthMonday(year, 0, 2)],       // 成人の日（1月第2月曜）
+    [2, 11],                             // 建国記念の日
     [2, 23],                             // 天皇誕生日
     [3, spring],                         // 春分の日
     [4, 29],                             // 昭和の日
