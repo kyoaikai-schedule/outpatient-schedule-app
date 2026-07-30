@@ -8475,6 +8475,8 @@ const WardScheduleSystem = () => {
                           }}
                           className="w-full px-3 py-2 border-2 rounded-lg"
                         >
+                          <option value={0}>0人</option>
+                          <option value={1}>1人</option>
                           <option value={2}>2人</option>
                           <option value={3}>3人</option>
                           <option value={4}>4人</option>
@@ -8494,6 +8496,8 @@ const WardScheduleSystem = () => {
                           }}
                           className="w-full px-3 py-2 border-2 rounded-lg"
                         >
+                          <option value={0}>0人</option>
+                          <option value={1}>1人</option>
                           <option value={2}>2人</option>
                           <option value={3}>3人</option>
                           <option value={4}>4人</option>
@@ -8630,7 +8634,7 @@ const WardScheduleSystem = () => {
                           onChange={(e) => setGenerateConfig(prev => ({ ...prev, weekdayDayStaff: parseInt(e.target.value) }))}
                           className="w-full px-3 py-2 border-2 rounded-lg"
                         >
-                          {Array.from({ length: 20 }, (_, i) => i + 1).map(n => (
+                          {Array.from({ length: 35 }, (_, i) => i + 1).map(n => (
                             <option key={n} value={n}>{n}人</option>
                           ))}
                         </select>
@@ -8642,7 +8646,7 @@ const WardScheduleSystem = () => {
                           onChange={(e) => setGenerateConfig(prev => ({ ...prev, weekendDayStaff: parseInt(e.target.value) }))}
                           className="w-full px-3 py-2 border-2 rounded-lg"
                         >
-                          {Array.from({ length: 15 }, (_, i) => i + 1).map(n => (
+                          {Array.from({ length: 35 }, (_, i) => i + 1).map(n => (
                             <option key={n} value={n}>{n}人</option>
                           ))}
                         </select>
