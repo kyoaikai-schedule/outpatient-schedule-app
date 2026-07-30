@@ -188,10 +188,18 @@ const createDBFunctions = (prefix: string) => {
     return data?.value || null;
   };
   const saveSettingToDB = async (key: string, value: string) => {
-    await supabase.from(t('settings')).upsert(
-      { key, value, updated_at: new Date().toISOString() },
+    // updated_at は outpatient_settings に存在せず（カラムは id / key / value / created_at）、
+    // 送るとリクエスト全体が PGRST204 で拒否され設定が一切保存されない。
+    // 読み込み側は value のみ参照するため送らない（created_at は DEFAULT NOW() で埋まる）。
+    const { error } = await supabase.from(t('settings')).upsert(
+      { key, value },
       { onConflict: 'key' }
     );
+    // エラーを握り潰すとサイレントに保存されない状態が再発するため、必ず可視化して投げる
+    if (error) {
+      console.error(`[saveSettingToDB] 設定の保存に失敗しました (key=${key}):`, error);
+      throw error;
+    }
   };
 
   const insertAuditLog = async (log: { action: string; user_type?: string; user_name?: string; nurse_id?: number; nurse_name?: string; year?: number; month?: number; day?: number; old_value?: string; new_value?: string; details?: string }) => {
@@ -718,67 +726,76 @@ const WardScheduleSystem = () => {
     loadData();
   }, [targetYear, targetMonth]);
 
+  // === 設定の autosave（500ms debounce）===
+  // debounce の途中でモーダルを閉じる / ログアウトすると、依存配列の変化で
+  // cleanup が走りタイマーが破棄されて保存が失われる。保存待ちの値を ref に保持し、
+  // flushPendingSettings() で確定できるようにする。
+  const pendingSettingsRef = useRef<Record<string, string>>({});
+
+  const commitSetting = async (key: string, value: string) => {
+    try {
+      await saveSettingToDB(key, value);
+      // 保存後に更に新しい値が積まれている場合は消さない
+      if (pendingSettingsRef.current[key] === value) delete pendingSettingsRef.current[key];
+    } catch (e) {
+      console.error('[設定の保存に失敗]', key, e);
+    }
+  };
+
+  // 保存待ちの設定を即座に確定させる（設定モーダルを閉じる / ログアウト時に呼ぶ）
+  const flushPendingSettings = () => {
+    Object.entries({ ...pendingSettingsRef.current }).forEach(([key, value]) => {
+      commitSetting(key, value);
+    });
+  };
+
+  // 設定の変更を debounce して保存する。戻り値は useEffect の cleanup。
+  const scheduleSettingSave = (key: string, value: string) => {
+    pendingSettingsRef.current[key] = value;
+    const timer = setTimeout(() => { commitSetting(key, value); }, 500);
+    return () => clearTimeout(timer);
+  };
+
   // generateConfigの変更をDBに保存
   useEffect(() => {
     if (!settingsLoaded || !isAdminAuth) return;
-    const timer = setTimeout(() => {
-      saveSettingToDB('generateConfig', JSON.stringify(generateConfig));
-    }, 500);
-    return () => clearTimeout(timer);
+    return scheduleSettingSave('generateConfig', JSON.stringify(generateConfig));
   }, [generateConfig, settingsLoaded, isAdminAuth]);
 
   // requestDeadlineの変更をDBに保存
   useEffect(() => {
     if (!settingsLoaded || !isAdminAuth) return;
-    const timer = setTimeout(() => {
-      saveSettingToDB('requestDeadline', JSON.stringify(requestDeadline));
-    }, 500);
-    return () => clearTimeout(timer);
+    return scheduleSettingSave('requestDeadline', JSON.stringify(requestDeadline));
   }, [requestDeadline, settingsLoaded, isAdminAuth]);
 
   // customShiftsの変更をDBに保存
   useEffect(() => {
     if (!settingsLoaded || !isAdminAuth) return;
-    const timer = setTimeout(() => {
-      saveSettingToDB('customShifts', JSON.stringify(customShifts));
-    }, 500);
-    return () => clearTimeout(timer);
+    return scheduleSettingSave('customShifts', JSON.stringify(customShifts));
   }, [customShifts, settingsLoaded, isAdminAuth]);
 
   // useSolverAPIの変更をDBに保存
   useEffect(() => {
     if (!settingsLoaded || !isAdminAuth) return;
-    const timer = setTimeout(() => {
-      saveSettingToDB('useSolverAPI', String(useSolverAPI));
-    }, 500);
-    return () => clearTimeout(timer);
+    return scheduleSettingSave('useSolverAPI', String(useSolverAPI));
   }, [useSolverAPI, settingsLoaded, isAdminAuth]);
 
   // requestLimitConfigの変更をDBに保存
   useEffect(() => {
     if (!settingsLoaded || !isAdminAuth) return;
-    const timer = setTimeout(() => {
-      saveSettingToDB('requestLimitConfig', JSON.stringify(requestLimitConfig));
-    }, 500);
-    return () => clearTimeout(timer);
+    return scheduleSettingSave('requestLimitConfig', JSON.stringify(requestLimitConfig));
   }, [requestLimitConfig, settingsLoaded, isAdminAuth]);
 
   // dailyOverridesの変更をDBに保存
   useEffect(() => {
     if (!settingsLoaded || !isAdminAuth) return;
-    const timer = setTimeout(() => {
-      saveSettingToDB('dailyOverrides', JSON.stringify(dailyOverrides));
-    }, 500);
-    return () => clearTimeout(timer);
+    return scheduleSettingSave('dailyOverrides', JSON.stringify(dailyOverrides));
   }, [dailyOverrides, settingsLoaded, isAdminAuth]);
 
   // closedDaysConfigの変更をDBに保存
   useEffect(() => {
     if (!settingsLoaded || !isAdminAuth) return;
-    const timer = setTimeout(() => {
-      saveSettingToDB('closedDaysConfig', JSON.stringify(closedDaysConfig));
-    }, 500);
-    return () => clearTimeout(timer);
+    return scheduleSettingSave('closedDaysConfig', JSON.stringify(closedDaysConfig));
   }, [closedDaysConfig, settingsLoaded, isAdminAuth]);
 
   // ページ離脱時の確認ダイアログ
@@ -1176,6 +1193,8 @@ const WardScheduleSystem = () => {
   };
 
   const handleAdminLogout = () => {
+    // debounce 中の設定変更を破棄しないよう、ログアウト前に確定させる
+    flushPendingSettings();
     setIsAdminAuth(false);
     setAdminPassword('');
     setSystemMode('select');
@@ -8497,7 +8516,7 @@ const WardScheduleSystem = () => {
                   <h3 className="text-xl font-bold">⚙️ 勤務表生成設定</h3>
                   <button
                     type="button"
-                    onClick={() => setShowGenerateConfig(false)}
+                    onClick={() => { flushPendingSettings(); setShowGenerateConfig(false); }}
                     className="p-2 hover:bg-gray-100 rounded-full transition-colors"
                   >
                     <X size={24} />
@@ -8864,7 +8883,7 @@ const WardScheduleSystem = () => {
                 <div className="flex justify-between items-center mt-6">
                   <button
                     type="button"
-                    onClick={() => setShowGenerateConfig(false)}
+                    onClick={() => { flushPendingSettings(); setShowGenerateConfig(false); }}
                     className="px-4 py-2 bg-gray-200 hover:bg-gray-300 text-gray-700 rounded-lg transition-colors"
                   >
                     閉じる
