@@ -471,7 +471,7 @@ const WardScheduleSystem = () => {
   const [prevMonthConstraints, setPrevMonthConstraints] = useState<any>({});
   
   // 職員別シフト設定: { nurseId: { maxNightShifts: number, noNightShift: boolean, noDayShift: boolean } }
-  const [nurseShiftPrefs, setNurseShiftPrefs] = useState<Record<number, { maxNightShifts: number; noNightShift: boolean; noDayShift: boolean; excludeFromMaxDaysOff: boolean; maxRequests: number; excludeFromGeneration: boolean; requestLimits?: Record<string, number> }>>({});
+  const [nurseShiftPrefs, setNurseShiftPrefs] = useState<Record<number, { maxNightShifts: number; noNightShift: boolean; noDayShift: boolean; excludeFromMaxDaysOff: boolean; maxRequests: number; excludeFromGeneration: boolean; requestLimits?: Record<string, number>; useHalfDayOff?: boolean }>>({});
   const [showNurseShiftPrefs, setShowNurseShiftPrefs] = useState(false);
   const [requestLimitConfig, setRequestLimitConfig] = useState<RequestLimitConfig>({
     dailyLimits: { weekday: {}, saturday: {}, sunday: {}, holiday: {} },
@@ -3446,6 +3446,80 @@ const WardScheduleSystem = () => {
     return { border, alignment: center, fill: { fgColor: { rgb: 'F3F4F6' } }, font: { bold: true } };
   };
 
+  // ============================================
+  // 外来形式（公休・半休）への変換
+  // ============================================
+  // 外来は休みを「公休」と「半休」で管理する。生成結果は 日 / 休 の2値なので、
+  // 生成後にラベルだけを置き換えて実績の表記に合わせる（ソルバーには一切触らない）。
+  //   ・休診日の「休」        → 変換しない（公休として成立する）
+  //   ・休診日以外の「休」    → 終日休（半/半）
+  //   ・土曜の「日」          → 午後半（午前のみ勤務）
+  //   ・上記以外              → 変換しない
+  // 「半/半」は 休 ではなく、「午後半」は 日 ではないため、2回実行しても結果は変わらない（冪等）。
+
+  // 終日休に使うカスタムシフトの記号。ハードコードした記号で登録済みのシフトを探し、
+  // 見つからなければ変換せずに登録を促す（記号を勝手に作らない）。
+  const FULL_DAY_OFF_SYMBOL = '半/半';
+  const fullDayOffShift = useMemo(
+    () => customShifts.find(cs => cs.symbol === FULL_DAY_OFF_SYMBOL) || null,
+    [customShifts]
+  );
+
+  // 「半休で消化」設定。未設定（undefined）は既定オンとして扱う。
+  const usesHalfDayOff = (nurseId: number) => nurseShiftPrefs[nurseId]?.useHalfDayOff !== false;
+
+  const [conversionResult, setConversionResult] = useState<{ month: string; nurses: number; off: number; sat: number } | null>(null);
+
+  const convertToOutpatientFormat = () => {
+    const monthKey = `${targetYear}-${targetMonth}`;
+    if (!schedule || schedule.month !== monthKey) { alert('勤務表が生成されていません'); return; }
+    if (!fullDayOffShift) {
+      alert(`カスタムシフト「${FULL_DAY_OFF_SYMBOL}」が登録されていません。\nダッシュボードの「シフト種類」から追加してから実行してください。`);
+      return;
+    }
+    // 「半休で消化」がオンの職員のみ。生成除外の職員は対象外（手動入力のセルを書き換えない）。
+    const targets = activeNurses.filter(n => usesHalfDayOff(n.id) && !nurseShiftPrefs[n.id]?.excludeFromGeneration);
+    if (targets.length === 0) { alert('「半休で消化」が有効な職員がいません（職員別シフト設定で確認してください）'); return; }
+
+    const closedDayLabel = closedDays.length > 0 ? `${closedDays.join(', ')}日` : 'なし';
+    if (!confirm(
+      `${targets.length}名の勤務表を外来形式に変換します。\n` +
+      `休みを「${FULL_DAY_OFF_SYMBOL}」に、土曜の日勤を「午後半」に置き換えます。\n\n` +
+      `※休診日（${closedDayLabel}）の「休」は公休としてそのまま残します。\n` +
+      `※「半休で消化」がオフの職員は変換しません。`
+    )) return;
+
+    const closedDaySet = new Set(closedDays);
+    const newData: Record<number, (string | null)[]> = JSON.parse(JSON.stringify(schedule.data));
+    let offConverted = 0;
+    let satConverted = 0;
+
+    targets.forEach(n => {
+      const shifts = newData[n.id];
+      if (!Array.isArray(shifts)) return;
+      for (let d = 0; d < daysInMonth; d++) {
+        const day = d + 1;
+        const cur = shifts[d];
+        if (!cur) continue;  // 空セル（生成除外の職員など）は対象外
+        if (cur === '休') {
+          if (closedDaySet.has(day)) continue;  // 休診日の休は公休として残す
+          shifts[d] = FULL_DAY_OFF_SYMBOL;
+          offConverted++;
+        } else if (cur === '日' && new Date(targetYear, targetMonth, day).getDay() === 6) {
+          shifts[d] = '午後半';
+          satConverted++;
+        }
+      }
+    });
+
+    setSchedule((prev: any) => ({ ...prev, data: newData }));
+    saveScheduleToLocalStorage(newData);
+    saveWithStatus(async () => {
+      await saveSchedulesToDB(targetYear, targetMonth, newData);
+    });
+    setConversionResult({ month: monthKey, nurses: targets.length, off: offConverted, sat: satConverted });
+  };
+
   // Excel出力（カラー対応）
   const exportToExcel = () => {
     if (!schedule) { alert('勤務表が生成されていません'); return; }
@@ -6405,8 +6479,26 @@ const WardScheduleSystem = () => {
                   <Download size={isMaximized ? 14 : 18} />
                   Excel出力
                 </button>
+                <button
+                  onClick={convertToOutpatientFormat}
+                  disabled={!schedule}
+                  title={`休みを「${FULL_DAY_OFF_SYMBOL}」に、土曜の日勤を「午後半」に置き換えます（休診日の休はそのまま）`}
+                  className={`bg-amber-500 hover:bg-amber-600 text-white rounded-lg flex items-center gap-1 transition-colors disabled:opacity-50 ${isMaximized ? 'px-2 py-1 text-xs' : 'px-4 py-2'}`}
+                >
+                  <Edit2 size={isMaximized ? 14 : 18} />
+                  外来形式に変換
+                </button>
               </div>
             </div>
+
+            {/* 外来形式への変換結果（最大化時は非表示） */}
+            {!isMaximized && conversionResult && conversionResult.month === `${targetYear}-${targetMonth}` && (
+              <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 mb-4 text-sm text-amber-800">
+                <strong>✅ 外来形式に変換しました（{conversionResult.nurses}名）：</strong>
+                {` 休 → ${FULL_DAY_OFF_SYMBOL}: ${conversionResult.off}件 / 土曜の 日 → 午後半: ${conversionResult.sat}件`}
+                {conversionResult.off === 0 && conversionResult.sat === 0 && '（変換対象のセルはありませんでした）'}
+              </div>
+            )}
 
             {/* 手動編集の説明（最大化時は非表示） */}
             {!isMaximized && (
@@ -8162,6 +8254,7 @@ const WardScheduleSystem = () => {
                     未設定の場合は共通設定（最大{generateConfig.maxNightShifts}回）が適用されます。
                     「希望上限」は職員が入力できる希望数の上限です（0=無制限）。明・管明は自動設定のためカウントに含まれません。
                     生成除外にチェックすると自動生成の対象外になります（手動でシフトを入力してください）。カスタムシフト（研修・出張等）はダッシュボードの「シフト種類」から追加できます。
+                    「半休で消化」は勤務表の「外来形式に変換」で休みを「{FULL_DAY_OFF_SYMBOL}」に置き換える対象かどうかです（既定オン。オフの職員は「休」のまま残ります）。
                   </p>
                 </div>
 
@@ -8178,11 +8271,12 @@ const WardScheduleSystem = () => {
                         <th className="border p-2 text-center">希望上限</th>
                         <th className="border p-2 text-center">シフト別制限</th>
                         <th className="border p-2 text-center">生成除外</th>
+                        <th className="border p-2 text-center">半休で消化</th>
                       </tr>
                     </thead>
                     <tbody>
                       {activeNurses.map((nurse: any) => {
-                        const pref = nurseShiftPrefs[nurse.id] || { maxNightShifts: generateConfig.maxNightShifts, noNightShift: false, noDayShift: false, excludeFromMaxDaysOff: false, maxRequests: 0, excludeFromGeneration: false };
+                        const pref = nurseShiftPrefs[nurse.id] || { maxNightShifts: generateConfig.maxNightShifts, noNightShift: false, noDayShift: false, excludeFromMaxDaysOff: false, maxRequests: 0, excludeFromGeneration: false, useHalfDayOff: true };
                         return (
                           <tr key={nurse.id} className="hover:bg-gray-50">
                             <td className="border p-2 font-medium whitespace-nowrap">
@@ -8302,6 +8396,19 @@ const WardScheduleSystem = () => {
                                   }));
                                 }}
                                 className="w-5 h-5 text-red-600 rounded"
+                              />
+                            </td>
+                            <td className="border p-2 text-center">
+                              <input
+                                type="checkbox"
+                                checked={pref.useHalfDayOff !== false}
+                                onChange={(e) => {
+                                  setNurseShiftPrefs(prev => ({
+                                    ...prev,
+                                    [nurse.id]: { ...pref, useHalfDayOff: e.target.checked }
+                                  }));
+                                }}
+                                className="w-5 h-5 text-amber-600 rounded"
                               />
                             </td>
                           </tr>
