@@ -52,6 +52,13 @@ type RequestLimitConfig = {
 
 type DailyOverrides = Record<number, Record<string, number>>;
 
+// 休診日設定（休診日 = 全職員が休みになる日。外来は日曜・祝日が該当）
+type ClosedDaysConfig = {
+  sundayClosed: boolean;   // 日曜を休診日にする
+  holidayClosed: boolean;  // 祝日を休診日にする
+  extraDates: string[];    // 追加の休診日（'YYYY-MM-DD' 形式。お盆・年末年始などの臨時休診用）
+};
+
 const SHIFT_TYPES = {
   日: { name: '日勤', hours: 7.5, color: 'bg-blue-100 text-blue-700' },
   夜: { name: '夜勤', hours: 14.5, color: 'bg-purple-100 text-purple-700' },
@@ -294,6 +301,36 @@ const isWeekend = (year, month, day) => {
   return d.getDay() === 0 || d.getDay() === 6;
 };
 
+const DEFAULT_CLOSED_DAYS_CONFIG: ClosedDaysConfig = {
+  // 外来の実態に合わせ、日曜・祝日の両方を既定でオンにする
+  sundayClosed: true,
+  holidayClosed: true,
+  extraDates: [],
+};
+
+// 当月の休診日を算出する（1-based day の昇順配列を返す）
+// month は 0-based。祝日判定は getJapaneseHolidays を流用する。
+const getClosedDays = (year: number, month: number, config: ClosedDaysConfig): number[] => {
+  const daysInM = getDaysInMonth(year, month);
+  const days = new Set<number>();
+  if (config?.sundayClosed) {
+    for (let d = 1; d <= daysInM; d++) {
+      if (new Date(year, month, d).getDay() === 0) days.add(d);
+    }
+  }
+  if (config?.holidayClosed) {
+    getJapaneseHolidays(year, month).forEach(d => days.add(d));
+  }
+  (config?.extraDates || []).forEach(s => {
+    const m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(String(s).trim());
+    if (!m) return;
+    if (Number(m[1]) !== year || Number(m[2]) !== month + 1) return;
+    const d = Number(m[3]);
+    if (d >= 1 && d <= daysInM) days.add(d);
+  });
+  return Array.from(days).sort((a, b) => a - b);
+};
+
 interface ScheduleVersion {
   id: string;
   version: number;
@@ -433,6 +470,9 @@ const WardScheduleSystem = () => {
     personalDayTypeLimits: { weekday: 0, saturday: 0, sunday: 0, holiday: 0 },
   });
   const [dailyOverrides, setDailyOverrides] = useState<DailyOverrides>({});
+  // 休診日設定（全職員が休みになる日。ソルバー送信時に '休' 希望として合成する）
+  const [closedDaysConfig, setClosedDaysConfig] = useState<ClosedDaysConfig>({ ...DEFAULT_CLOSED_DAYS_CONFIG });
+  const [extraClosedDateInput, setExtraClosedDateInput] = useState('');
   const [showRequestLimits, setShowRequestLimits] = useState(false);
   const [editingLimitDay, setEditingLimitDay] = useState<{ day: number; x: number; y: number } | null>(null);
   const [limitPopPos, setLimitPopPos] = useState<{ x: number; y: number }>({ x: 0, y: 0 });
@@ -603,6 +643,19 @@ const WardScheduleSystem = () => {
           try { setDailyOverrides(JSON.parse(savedDailyOvr)); } catch(e) { console.error('dailyOverrides解析エラー:', e); }
         }
 
+        // 休診日設定の読み込み（未保存なら既定値=日曜・祝日オンを維持）
+        const savedClosedDays = await fetchSettingFromDB('closedDaysConfig');
+        if (savedClosedDays) {
+          try {
+            const parsed = JSON.parse(savedClosedDays);
+            setClosedDaysConfig({
+              sundayClosed: parsed?.sundayClosed ?? DEFAULT_CLOSED_DAYS_CONFIG.sundayClosed,
+              holidayClosed: parsed?.holidayClosed ?? DEFAULT_CLOSED_DAYS_CONFIG.holidayClosed,
+              extraDates: Array.isArray(parsed?.extraDates) ? parsed.extraDates.map((d: any) => String(d)) : [],
+            });
+          } catch(e) { console.error('closedDaysConfig解析エラー:', e); }
+        }
+
         // 夜勤NG組み合わせの読み込み
         const savedNgPairs = await fetchSettingFromDB('nightNgPairs');
         if (savedNgPairs) {
@@ -718,6 +771,15 @@ const WardScheduleSystem = () => {
     }, 500);
     return () => clearTimeout(timer);
   }, [dailyOverrides, settingsLoaded, isAdminAuth]);
+
+  // closedDaysConfigの変更をDBに保存
+  useEffect(() => {
+    if (!settingsLoaded || !isAdminAuth) return;
+    const timer = setTimeout(() => {
+      saveSettingToDB('closedDaysConfig', JSON.stringify(closedDaysConfig));
+    }, 500);
+    return () => clearTimeout(timer);
+  }, [closedDaysConfig, settingsLoaded, isAdminAuth]);
 
   // ページ離脱時の確認ダイアログ
   useEffect(() => {
@@ -868,6 +930,12 @@ const WardScheduleSystem = () => {
     ), [nurses]);
   
   const daysInMonth = getDaysInMonth(targetYear, targetMonth);
+
+  // 対象月の休診日（1-based day の配列）
+  const closedDays = useMemo(
+    () => getClosedDays(targetYear, targetMonth, closedDaysConfig),
+    [targetYear, targetMonth, closedDaysConfig]
+  );
 
   // 各看護師にアクセスコードを付与
   const nursesWithCodes = useMemo(() =>
@@ -1852,6 +1920,25 @@ const WardScheduleSystem = () => {
       );
     }
 
+    // === 休診日は全職員の '休' 希望として合成する ===
+    // 希望は solver.py 側で add(shifts[(n,d)] == val) のハード制約になるため、
+    // 日勤者数の要求とぶつかっても確実に全員休みになる。
+    // DBには保存せず、送信するJSONの中だけで合成する（希望レコードを毎月量産しない）。
+    // 生成除外の職員は generationNurses に含まれないため対象外。
+    const solverClosedDays = getClosedDays(targetYear, targetMonth, closedDaysConfig);
+    if (solverClosedDays.length > 0) {
+      generationNurses.forEach(n => {
+        const key = String(n.id);
+        if (!requestData[key]) requestData[key] = {};
+        // 休診日に出勤希望が入っていても休診が優先されるため上書きする
+        solverClosedDays.forEach(d => { requestData[key][String(d)] = '休'; });
+      });
+      console.log(
+        `[buildSolverRequest] 休診日 ${solverClosedDays.length}日を全職員(${generationNurses.length}名)の '休' 希望として合成:`,
+        solverClosedDays
+      );
+    }
+
     // 年度切り替え対策: 現在のスタッフリストに存在しない ID の prevMonthConstraints は除外
     // (前月在籍で当月不在のスタッフが残っているとソルバーが警告するため)
     const activeNurseIdSet = new Set(generationNurses.map(n => String(n.id)));
@@ -1909,9 +1996,12 @@ const WardScheduleSystem = () => {
   const getHalfDayRestoreMap = (): Record<string, Record<number, string>> => {
     const monthKey = `${targetYear}-${targetMonth}`;
     const map: Record<string, Record<number, string>> = {};
+    // 休診日は '休' で上書きして送っているため、半休ラベルへ戻してはならない
+    const closedDaySet = new Set(getClosedDays(targetYear, targetMonth, closedDaysConfig));
     Object.entries(requests[monthKey] || {}).forEach(([nid, days]: [string, any]) => {
       Object.entries(days || {}).forEach(([day, label]) => {
         // requests のキーは1-based、ソルバー結果の配列は0-based
+        if (closedDaySet.has(Number(day))) return;
         if (typeof label === 'string' && HALF_DAY_REQUEST_SHIFTS[label]) {
           if (!map[nid]) map[nid] = {};
           map[nid][Number(day) - 1] = label;
@@ -8640,7 +8730,7 @@ const WardScheduleSystem = () => {
                         </select>
                       </div>
                       <div>
-                        <label className="block text-sm font-medium text-gray-700 mb-1">土日・祝日</label>
+                        <label className="block text-sm font-medium text-gray-700 mb-1">土曜</label>
                         <select
                           value={generateConfig.weekendDayStaff}
                           onChange={(e) => setGenerateConfig(prev => ({ ...prev, weekendDayStaff: parseInt(e.target.value) }))}
@@ -8679,6 +8769,94 @@ const WardScheduleSystem = () => {
                     
                     <div className="mt-3 text-xs text-blue-600">
                       ※ 年末年始設定は12月・1月の勤務表生成時に適用されます
+                    </div>
+                  </div>
+
+                  {/* 休診日設定 */}
+                  <div className="bg-rose-50 border border-rose-200 rounded-xl p-4">
+                    <h4 className="font-bold text-rose-800 mb-3 flex items-center gap-2">
+                      <CalendarDays size={20} />
+                      休診日の設定
+                    </h4>
+                    <p className="text-xs text-gray-600 mb-3">
+                      休診日は全職員が休みになる日です。生成時に全職員の「休」希望として扱われ、日勤者数の設定より優先されます。
+                    </p>
+
+                    <div className="space-y-2">
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={closedDaysConfig.sundayClosed}
+                          onChange={(e) => setClosedDaysConfig(prev => ({ ...prev, sundayClosed: e.target.checked }))}
+                          className="w-5 h-5 text-rose-600 rounded"
+                        />
+                        <span className="text-sm font-medium text-gray-700">日曜を休診日にする</span>
+                      </label>
+                      <label className="flex items-center gap-2 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={closedDaysConfig.holidayClosed}
+                          onChange={(e) => setClosedDaysConfig(prev => ({ ...prev, holidayClosed: e.target.checked }))}
+                          className="w-5 h-5 text-rose-600 rounded"
+                        />
+                        <span className="text-sm font-medium text-gray-700">祝日を休診日にする</span>
+                      </label>
+                    </div>
+
+                    <div className="mt-4">
+                      <label className="block text-sm font-medium text-gray-700 mb-1">追加の休診日（お盆・年末年始などの臨時休診）</label>
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="date"
+                          value={extraClosedDateInput}
+                          onChange={(e) => setExtraClosedDateInput(e.target.value)}
+                          className="px-3 py-2 border-2 rounded-lg text-sm"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => {
+                            const v = extraClosedDateInput.trim();
+                            if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return;
+                            setClosedDaysConfig(prev => (
+                              prev.extraDates.includes(v)
+                                ? prev
+                                : { ...prev, extraDates: [...prev.extraDates, v].sort() }
+                            ));
+                            setExtraClosedDateInput('');
+                          }}
+                          disabled={!/^\d{4}-\d{2}-\d{2}$/.test(extraClosedDateInput.trim())}
+                          className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white rounded-lg text-sm font-medium disabled:opacity-50"
+                        >
+                          <Plus size={16} className="inline mr-1" />追加
+                        </button>
+                      </div>
+                      {closedDaysConfig.extraDates.length > 0 && (
+                        <div className="flex flex-wrap gap-2 mt-2">
+                          {closedDaysConfig.extraDates.map(d => (
+                            <span key={d} className="inline-flex items-center gap-1 px-2 py-1 bg-white border border-rose-300 rounded-lg text-xs">
+                              {d}
+                              <button
+                                type="button"
+                                onClick={() => setClosedDaysConfig(prev => ({ ...prev, extraDates: prev.extraDates.filter(x => x !== d) }))}
+                                className="text-rose-600 hover:text-rose-800"
+                                title="削除"
+                              >
+                                <X size={12} />
+                              </button>
+                            </span>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="mt-4 p-3 bg-white border border-rose-200 rounded-lg text-sm">
+                      {closedDays.length > 0 ? (
+                        <span className="text-rose-800 font-medium">
+                          {targetYear}年{targetMonth + 1}月の休診日: {closedDays.join(', ')}日（{closedDays.length}日間）
+                        </span>
+                      ) : (
+                        <span className="text-gray-500">{targetYear}年{targetMonth + 1}月の休診日: なし</span>
+                      )}
                     </div>
                   </div>
                 </div>
