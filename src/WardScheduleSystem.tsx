@@ -290,6 +290,49 @@ const getClosedDays = (year: number, month: number, config: ClosedDaysConfig): n
   return Array.from(days).sort((a, b) => a - b);
 };
 
+// ── 土曜(半日診療)の表示専用ラベル置換 ───────────────────────────────
+// 外来の土曜は半日診療で、職員は午前のみ勤務し午後は休む。ソルバーは半休の概念を
+// 持たず終日の日勤ラベルを返すため、印刷した勤務表を見た職員が終日勤務と誤解する。
+//
+// ★ラベルの選択: 「午前半休」「午後半休」はどちらの半分が"休み"かを表す名称である。
+//   土曜は午前勤務・午後休みなので、正しいのは午後が休みの '午後半'(名称: 午後半休)。
+//   allShifts での分類は category:'half_off'、hours:3.75。
+//   '後' は職員入力の短縮表記で sanitizeShift が '午後半' へ正規化する側の値のため使わない。
+//
+// ★表示専用: DB・state・集計には一切反映しない。置換するのは勤務表グリッドの
+//   セル文字列だけで、休日人数/出勤計などの集計行・個人別集計列・Excel出力は
+//   変換前の値をそのまま読む（本タスク前とバイト単位で同一の挙動）。
+//
+// ★日付の基数: getClosedDays は 1-based、勤務表の配列は 0-based。
+//   配列に合わせた 0-based の集合を返し、休診日との照合時のみ +1 する。
+//
+// 文字列は既存定数から実体を採る（異体字・全角半角の取り違えを防ぐため手入力しない）。
+const SATURDAY_FULL_DAY_LABEL = SOLVER_APPLICABLE_SHIFTS[4];                 // '日'
+const SATURDAY_HALF_OFF_LABEL = Object.keys(HALF_DAY_REQUEST_SHIFTS)[3];     // '午後半'
+
+// 半日診療として表示する土曜の 0-based 日インデックス集合。休診の土曜は除外する。
+const getSaturdayDisplayIdxs = (
+  year: number, month: number, daysInMonth: number, config: ClosedDaysConfig,
+): Set<number> => {
+  const closedDaySet1Based = new Set(getClosedDays(year, month, config));
+  const idxs = new Set<number>();
+  for (let i = 0; i < daysInMonth; i++) {
+    if (new Date(year, month, i + 1).getDay() !== 6) continue; // 土曜以外は対象外
+    if (closedDaySet1Based.has(i + 1)) continue;               // 休診の土曜は対象外
+    idxs.add(i);
+  }
+  return idxs;
+};
+
+// 表示用ラベルへ変換する。置換するのは終日勤務ラベルのみ。
+// 夜・管夜・明・管明・休・有、および getHalfDayRestoreMap が復元した半休ラベルは
+// 終日勤務ラベルと一致しないため、この関数は決して上書きしない。
+const toSaturdayDisplayShift = (
+  shift: any, dayIdx0Based: number, saturdayIdxs: Set<number>,
+): any => (shift === SATURDAY_FULL_DAY_LABEL && saturdayIdxs.has(dayIdx0Based)
+  ? SATURDAY_HALF_OFF_LABEL
+  : shift);
+
 interface ScheduleVersion {
   id: string;
   version: number;
@@ -6553,6 +6596,10 @@ const WardScheduleSystem = () => {
             });
           }
 
+          // 土曜(半日診療)のセル表示だけを差し替えるためのインデックス集合。
+          // scheduleDisplayData 本体は書き換えない（集計行・個人別列がこれを読むため）。
+          const saturdayDisplayIdxs = getSaturdayDisplayIdxs(targetYear, targetMonth, daysInMonth, closedDaysConfig);
+
           // セル編集ハンドラ（schedule未生成時は自動作成）
           // ポップオーバーパレット方式: クリックでパレットを開く
           const handleCellClick = (nurseId: any, dayIndex: number, currentShift: string | null, event: React.MouseEvent) => {
@@ -6909,7 +6956,9 @@ const WardScheduleSystem = () => {
                             }`}
                             style={{ minWidth: isMaximized ? '20px' : '32px' }}
                           >
-                            <div className={isMaximized ? 'text-[11px] leading-none' : ''}>{shift || ''}</div>
+                            {/* 表示のみ土曜の終日日勤を午後半休へ。shift 本体は変換しない
+                                （クリック時の現在値・希望比較・集計は変換前の値を使う） */}
+                            <div className={isMaximized ? 'text-[11px] leading-none' : ''}>{toSaturdayDisplayShift(shift, i, saturdayDisplayIdxs) || ''}</div>
                             {(hasError || hasWarning) && (
                               <span className={`absolute top-0 right-0 text-[8px] leading-none ${hasError ? 'text-red-500' : 'text-orange-400'}`}>▲</span>
                             )}
