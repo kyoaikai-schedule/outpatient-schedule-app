@@ -689,6 +689,24 @@ const WardScheduleSystem = () => {
 
   const validShifts = useMemo(() => Object.keys(allShifts), [allShifts]);
 
+  // ── シフト分類の単一定義 ────────────────────────────────────────────
+  // 表示・集計（サマリー行 / 個人別列 / Excel出力 / 職員画面）は必ずここを通す。
+  // シフト種類管理で category を 'off' にした記号（欠・産・育 …）を
+  // 記号名のハードコードで取りこぼさないための共通化。
+  //
+  // ★ 公休8日カウントにこれらを使ってはならない。
+  //   labor 上の公休は「休」「有」のみであり、欠勤等を算入できない。
+  //   公休カウントは generateSchedule 内の isOff（休/有のみ）が担当し、
+  //   意図的に別実装のまま残してある（CLAUDE.md「休日カウント」参照）。
+  const isOffShift = (s: any) => !!s && (s === '休' || s === '有' || allShifts[s]?.category === 'off');
+  const isHalfOffShift = (s: any) => !!s && (s === '午前半' || s === '午後半' || allShifts[s]?.category === 'half_off');
+  // 明・管明・研修など「出勤でも休みでもない」記号
+  const isOtherShift = (s: any) => !!s && (s === '明' || s === '管明' || allShifts[s]?.category === 'other');
+  // 出勤計（その日フロアに立つ人数）: 休・半休・その他 以外
+  const isOnDutyShift = (s: any) => !!s && !isOffShift(s) && !isHalfOffShift(s) && !isOtherShift(s);
+  // 勤務日数（月間の働いた日数）: 休・半休 以外。明/管明も勤務扱い（CLAUDE.md）
+  const isWorkedDayShift = (s: any) => !!s && !isOffShift(s) && !isHalfOffShift(s);
+
   const sanitizeShiftLocal = (s: any): string | null => {
     if (!s) return null;
     const str = String(s).trim();
@@ -3782,9 +3800,9 @@ const WardScheduleSystem = () => {
       const shifts = schedule.data[nurse.id] || [];
       const nightCount = shifts.filter((s: any) => s === '夜').length;
       const dayCount = shifts.filter((s: any) => s === '日').length;
-      const offCount = shifts.filter((s: any) => s === '休' || s === '有').length
-        + shifts.filter((s: any) => s === '午前半' || s === '午後半').length * 0.5;
-      const workCount = shifts.filter((s: any) => s && s !== '休' && s !== '有' && s !== '明' && s !== '管明').length;
+      const offCount = shifts.filter((s: any) => isOffShift(s)).length
+        + shifts.filter((s: any) => isHalfOffShift(s)).length * 0.5;
+      const workCount = shifts.filter((s: any) => isWorkedDayShift(s)).length;
       data.push([nurse.name, nurse.position, ...shifts.map((s: any) => s || ''), String(nightCount), String(dayCount), String(offCount), String(workCount)]);
     });
 
@@ -5733,8 +5751,8 @@ const WardScheduleSystem = () => {
             // 集計
             const dayShiftCount = myShifts.filter((s: any) => s === '日' || s === '午前半' || s === '午後半').length;
             const nightCount = myShifts.filter((s: any) => s === '夜').length;
-            const restCount = myShifts.filter((s: any) => s === '休' || s === '有').length
-              + myShifts.filter((s: any) => s === '午前半' || s === '午後半').length * 0.5;
+            const restCount = myShifts.filter((s: any) => isOffShift(s)).length
+              + myShifts.filter((s: any) => isHalfOffShift(s)).length * 0.5;
 
             return (
               <div className="fixed inset-0 bg-black/50 z-50 overflow-y-auto">
@@ -6836,9 +6854,9 @@ const WardScheduleSystem = () => {
                     const stats = {
                       night: shifts.filter(s => s === '夜').length,
                       day: shifts.filter(s => s === '日').length,
-                      off: shifts.filter(s => s === '休' || s === '有' || (s && allShifts[s]?.category === 'off')).length
-                        + shifts.filter(s => s === '午前半' || s === '午後半' || (s && allShifts[s]?.category === 'half_off')).length * 0.5,
-                      work: shifts.filter(s => s && s !== '休' && s !== '有' && s !== '午前半' && s !== '午後半' && allShifts[s]?.category !== 'off' && allShifts[s]?.category !== 'half_off').length
+                      off: shifts.filter(s => isOffShift(s)).length
+                        + shifts.filter(s => isHalfOffShift(s)).length * 0.5,
+                      work: shifts.filter(s => isWorkedDayShift(s)).length
                     };
                     
                     return (
@@ -7014,8 +7032,8 @@ const WardScheduleSystem = () => {
                       let count = 0;
                       activeNurses.forEach(nurse => {
                         const shift = (scheduleDisplayData[nurse.id] || [])[i];
-                        if (shift === '休' || shift === '有') count++;
-                        else if (shift === '午前半' || shift === '午後半') count += 0.5;
+                        if (isOffShift(shift)) count++;
+                        else if (isHalfOffShift(shift)) count += 0.5;
                       });
                       return (
                         <td key={i} className={`border text-center text-gray-600 ${isMaximized ? 'p-0 text-[10px]' : 'p-1'}`}>
@@ -7031,7 +7049,7 @@ const WardScheduleSystem = () => {
                       let count = 0;
                       activeNurses.forEach(nurse => {
                         const shift = (scheduleDisplayData[nurse.id] || [])[i];
-                        if (shift && shift !== '休' && shift !== '有' && shift !== '明' && shift !== '管明' && shift !== '午前半' && shift !== '午後半') count++;
+                        if (isOnDutyShift(shift)) count++;
                       });
                       return (
                         <td key={i} className={`border text-center text-amber-700 ${isMaximized ? 'p-0 text-[10px]' : 'p-1'}`}>
