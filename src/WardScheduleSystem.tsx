@@ -1186,8 +1186,6 @@ const WardScheduleSystem = () => {
     () => getClosedDays(targetYear, targetMonth, closedDaysConfig),
     [targetYear, targetMonth, closedDaysConfig]
   );
-  // 希望一覧のセル判定用（O(1) 参照）
-  const closedDaySet = useMemo(() => new Set(closedDays), [closedDays]);
 
   // 各看護師にアクセスコードを付与
   const nursesWithCodes = useMemo(() =>
@@ -7590,7 +7588,7 @@ const WardScheduleSystem = () => {
 
               <div className="bg-blue-50 border border-blue-200 rounded-xl p-3 mb-4">
                 <p className="text-sm text-blue-800">
-                  <strong>💡 編集できます：</strong>セルをクリックするとシフト選択が開き、選んだ内容がそのまま保存されます。「クリア」で希望を取り消せます。前月引継ぎ・休診日のセルは編集できません。
+                  <strong>💡 編集できます：</strong>セルをクリックするとシフト選択が開き、選んだ内容がそのまま保存されます。「クリア」で希望を取り消せます。前月引継ぎのセルは編集できません。
                 </p>
               </div>
 
@@ -7664,21 +7662,18 @@ const WardScheduleSystem = () => {
                                   .join('\n')
                               : undefined;
                             const isEditingThis = editingRequestCell?.nurseId === nurse.id && editingRequestCell?.day === day;
-                            // 休診日は buildSolverRequest で全職員 '休' に上書きされるため、希望を入れても
-                            // 生成時に必ず消える。前月制約日と同じくクリック不可にして入力させない。
-                            const isClosedDay = closedDaySet.has(day);
-                            // 編集可: 管理者 かつ 前月引継ぎセルでない かつ 休診日でない
-                            const isEditable = isAdminAuth && !con && !isClosedDay;
                             return (
                               <td
                                 key={day}
                                 title={conflictTip}
-                                onClick={isEditable ? (e) => {
+                                onClick={isAdminAuth ? (e) => {
+                                  // 前月制約日は勤務表グリッド・職員グリッドと同様にクリック不可
+                                  if (con) return;
                                   if (isEditingThis) { setEditingRequestCell(null); return; }
                                   const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
                                   setEditingRequestCell({ nurseId: nurse.id, day, x: rect.left, y: rect.bottom, top: rect.top });
                                 } : undefined}
-                                className={`border p-1 text-center ${isEditable ? 'cursor-pointer hover:ring-2 hover:ring-blue-300 hover:ring-inset' : ''} ${isEditingThis ? 'ring-2 ring-blue-500 ring-inset' : ''} ${isConflict ? 'ring-2 ring-red-500 ring-inset' : ''} ${
+                                className={`border p-1 text-center ${isAdminAuth && !con ? 'cursor-pointer hover:ring-2 hover:ring-blue-300 hover:ring-inset' : ''} ${isEditingThis ? 'ring-2 ring-blue-500 ring-inset' : ''} ${isConflict ? 'ring-2 ring-red-500 ring-inset' : ''} ${
                                 req === '休' ? 'bg-gray-200' :
                                 req === '有' ? 'bg-emerald-100' :
                                 req === '前' ? 'bg-orange-100' :
