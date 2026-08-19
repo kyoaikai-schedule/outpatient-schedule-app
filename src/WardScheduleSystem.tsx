@@ -102,6 +102,12 @@ const VALID_SHIFTS = ['日', '夜', '明', '管夜', '管明', '休', '有', '�
 // apply() には else 節がないため、ここに無いラベルは黙って無視される（サイレント失敗）。
 const SOLVER_APPLICABLE_SHIFTS = ['管夜', '管明', '明', '夜', '日', '休', '有'];
 
+// 休診日でも動く勤務・取り消してはならない希望。
+// 外来が休診でも管理当直(管夜)・夜勤(夜)は動き、その明け(管明/明)も続く。
+// 有給(有)は公休で塗り潰すと有休消化の記録が消える。
+// 文字化け・異体字混入を避けるため、5つの文字列は SOLVER_APPLICABLE_SHIFTS から現物を採取している。
+const CLOSED_DAY_PRESERVE_SHIFTS = ['管夜', '管明', '明', '夜', '有'];
+
 // 半休の希望ラベル → ソルバー送信値。
 // ソルバーは DAY / NIGHT / OFF の3値モデルで半休の概念を持たないため、
 // 半休は「日勤1名」としてソルバーへ送る（CWSの集計行も午後半休の職員を日勤1名として数える）。
@@ -2200,8 +2206,12 @@ const WardScheduleSystem = () => {
       generationNurses.forEach(n => {
         const key = String(n.id);
         if (!requestData[key]) requestData[key] = {};
-        // 休診日に出勤希望が入っていても休診が優先されるため上書きする
-        solverClosedDays.forEach(d => { requestData[key][String(d)] = '休'; });
+        // 休診日でも上書きしてよいのは日勤系・空きセルのみ。
+        // 管夜/管明/明/夜/有 は休診日でも成立する希望なので温存する。
+        solverClosedDays.forEach(d => {
+          const cur = requestData[key][String(d)];
+          if (!CLOSED_DAY_PRESERVE_SHIFTS.includes(cur)) requestData[key][String(d)] = '休';
+        });
       });
       console.log(
         `[buildSolverRequest] 休診日 ${solverClosedDays.length}日を全職員(${generationNurses.length}名)の '休' 希望として合成:`,
