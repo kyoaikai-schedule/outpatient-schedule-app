@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useLayoutEffect, useMemo, useRef } from 'react';
-import { Calendar, CalendarDays, Settings, Moon, Sun, Clock, RefreshCw, AlertCircle, CheckCircle, Plus, Trash2, LogOut, Lock, Download, Upload, Edit2, Save, X, Eye, Users, FileSpreadsheet, Activity, Maximize2, Minimize2, ChevronUp, ChevronDown, RotateCcw, History, BarChart3, UserX, List, Shield, GripVertical } from 'lucide-react';
+import { Calendar, CalendarDays, Settings, Moon, Sun, Clock, RefreshCw, AlertCircle, CheckCircle, Plus, Trash2, LogOut, Lock, Download, Upload, Edit2, Save, X, Eye, Users, FileSpreadsheet, Activity, Maximize2, Minimize2, ChevronUp, ChevronDown, RotateCcw, History, BarChart3, UserX, List, Shield, GripVertical, Undo2 } from 'lucide-react';
 import * as XLSX from 'xlsx-js-style';
 import { supabase } from './lib/supabase';
 import { validateRequests, buildConflictMap, RequestConflict } from './utils/validateRequests';
@@ -337,6 +337,8 @@ interface ScheduleVersion {
   id: string;
   version: number;
   timestamp: string;
+  // 自動保存されたバージョンに付ける説明。手動保存では未設定のまま（既存データとも互換）。
+  label?: string;
   data: Record<number, (string | null)[]>;
 }
 
@@ -1410,12 +1412,14 @@ const WardScheduleSystem = () => {
   // バージョン管理機能
   // ============================================
 
-  const saveCurrentAsVersion = () => {
+  // label を渡すとバージョン履歴に説明として表示される（手動保存時は未指定）。
+  const saveCurrentAsVersion = (label?: string) => {
     if (!schedule?.data) return;
     const newVersion: ScheduleVersion = {
       id: Date.now().toString(),
       version: nextVersionNumber,
       timestamp: new Date().toISOString(),
+      label,
       data: JSON.parse(JSON.stringify(schedule.data)),
     };
     let updated = [...scheduleVersions, newVersion];
@@ -3755,30 +3759,68 @@ const WardScheduleSystem = () => {
   // ============================================
   // 外来は休みを「公休」と「半休」で管理する。生成結果は 日 / 休 の2値なので、
   // 生成後にラベルだけを置き換えて実績の表記に合わせる（ソルバーには一切触らない）。
-  //   ・休診日の「休」        → 変換しない（公休として成立する）
-  //   ・休診日以外の「休」    → 終日休（半/半）
-  //   ・土曜の「日」          → 午後半（午前のみ勤務）
+  //   ・すべての「休」        → 公（CWS の終日公休。スラッシュ形式ではない）
+  //     休診日も例外にしない。実際の CWS 帳票は休診日にも同じ公休記号を書くため、
+  //     month 内で「休」と「公」の2表記に割れるのを避ける。
+  //   ・土曜の「日」          → /ﾊ（午前勤務・午後は半休。スラッシュの後ろが午後スロット）
   //   ・上記以外              → 変換しない
-  // 「半/半」は 休 ではなく、「午後半」は 日 ではないため、2回実行しても結果は変わらない（冪等）。
+  // 「公」は 休 ではなく、「/ﾊ」は 日 ではないため、2回実行しても結果は変わらない（冪等）。
+  //
+  // 記号はすべて既存の CWS パーサから実体を採取している（手入力しない）。
+  // 半角カナは全角と字形がほぼ同じで、取り違えても目視で気付けないため。
+  //   公  … normalizeShift(:2083) が '休' へ戻す
+  //   /ﾊ … normalizeCwsShift(:2112-2117) の '/' 規則。前半が空欄＝勤務と判定され '日' へ戻る
+  //        （CWS の集計行も午前のみ勤務の日を日勤として数えるため、これが正しい往復）
+  const CWS_FULL_DAY_OFF_SYMBOL = '公';
+  const CWS_SATURDAY_SYMBOL = '/ﾊ';
 
-  // 終日休に使うカスタムシフトの記号。ハードコードした記号で登録済みのシフトを探し、
-  // 見つからなければ変換せずに登録を促す（記号を勝手に作らない）。
-  const FULL_DAY_OFF_SYMBOL = '半/半';
-  const fullDayOffShift = useMemo(
-    () => customShifts.find(cs => cs.symbol === FULL_DAY_OFF_SYMBOL) || null,
+  // 変換前後の内部ラベル。正変換・逆変換の双方が同じ実体を参照する（綴りの取り違え防止）。
+  const INTERNAL_FULL_DAY_LABEL = SOLVER_APPLICABLE_SHIFTS[4]; // '日'
+  const INTERNAL_OFF_LABEL = SOLVER_APPLICABLE_SHIFTS[5];      // '休'
+
+  // 変換で書き込む記号はカスタムシフトとして登録済みである必要がある。
+  // 未登録の記号を書くと sanitizeShiftLocal(:766) が null に落として画面上セルが空になり、
+  // データが消えたように見えるため、登録を促して変換を中止する（記号を勝手に作らない）。
+  const missingCwsShifts = useMemo(
+    () => [CWS_FULL_DAY_OFF_SYMBOL, CWS_SATURDAY_SYMBOL]
+      .filter(sym => !customShifts.some(cs => cs.symbol === sym)),
     [customShifts]
   );
 
   // 「半休で消化」設定。未設定（undefined）は既定オンとして扱う。
   const usesHalfDayOff = (nurseId: number) => nurseShiftPrefs[nurseId]?.useHalfDayOff !== false;
 
-  const [conversionResult, setConversionResult] = useState<{ month: string; nurses: number; off: number; sat: number } | null>(null);
+  const [conversionResult, setConversionResult] = useState<{ month: string; nurses: number; off: number; sat: number; direction: 'toCws' | 'fromCws' } | null>(null);
+
+  // 変換対象の職員（正変換・逆変換で同一）。逆変換のボタン活性判定にも使う。
+  const cwsConvertTargets = useMemo(
+    () => activeNurses.filter(n => usesHalfDayOff(n.id) && !nurseShiftPrefs[n.id]?.excludeFromGeneration),
+    [activeNurses, nurseShiftPrefs]
+  );
+
+  // 当月に逆変換できるセル（CWS 記号）が1つでもあるか。無ければボタンを無効化する。
+  const hasCwsSymbolsInMonth = useMemo(() => {
+    if (!schedule || schedule.month !== `${targetYear}-${targetMonth}`) return false;
+    return cwsConvertTargets.some(n => {
+      const shifts = schedule.data[n.id];
+      return Array.isArray(shifts) && shifts.some(
+        (sh: any) => sh === CWS_FULL_DAY_OFF_SYMBOL || sh === CWS_SATURDAY_SYMBOL
+      );
+    });
+  }, [schedule, targetYear, targetMonth, cwsConvertTargets]);
+
+  // バージョン保存ラベル用のタイムスタンプ（正変換・逆変換で共用）。
+  const versionStamp = () => {
+    const t = new Date();
+    return `${t.getFullYear()}/${String(t.getMonth() + 1).padStart(2, '0')}/${String(t.getDate()).padStart(2, '0')} ` +
+      `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`;
+  };
 
   const convertToOutpatientFormat = () => {
     const monthKey = `${targetYear}-${targetMonth}`;
     if (!schedule || schedule.month !== monthKey) { alert('勤務表が生成されていません'); return; }
-    if (!fullDayOffShift) {
-      alert(`カスタムシフト「${FULL_DAY_OFF_SYMBOL}」が登録されていません。\nダッシュボードの「シフト種類」から追加してから実行してください。`);
+    if (missingCwsShifts.length > 0) {
+      alert(`カスタムシフト「${missingCwsShifts.join('」「')}」が登録されていません。\nダッシュボードの「シフト種類」から追加してから実行してください。`);
       return;
     }
     // 「半休で消化」がオンの職員のみ。生成除外の職員は対象外（手動入力のセルを書き換えない）。
@@ -3788,12 +3830,18 @@ const WardScheduleSystem = () => {
     const closedDayLabel = closedDays.length > 0 ? `${closedDays.join(', ')}日` : 'なし';
     if (!confirm(
       `${targets.length}名の勤務表を外来形式に変換します。\n` +
-      `休みを「${FULL_DAY_OFF_SYMBOL}」に、土曜の日勤を「午後半」に置き換えます。\n\n` +
-      `※休診日（${closedDayLabel}）の「休」は公休としてそのまま残します。\n` +
+      `休みを「${CWS_FULL_DAY_OFF_SYMBOL}」に、土曜の日勤を「${CWS_SATURDAY_SYMBOL}」に置き換えます。\n\n` +
+      `⚠️ この操作はデータベースに書き込みます（表示だけの変更ではありません）。\n` +
+      `変換前の状態はバージョンとして自動保存されるため、履歴から復元できます。\n\n` +
+      `※休診日（${closedDayLabel}）の「休」も含め、すべての「休」を変換します。\n` +
       `※「半休で消化」がオフの職員は変換しません。`
     )) return;
 
-    const closedDaySet = new Set(closedDays);
+    // newData を変更する前に、変換前の状態をバージョンとして自動保存する。
+    // 手動保存ボタンと同じ saveCurrentAsVersion を使い、保存経路を増やさない。
+    // 変換は schedule.data を上書きして DB へ永続化するため、これが唯一の復旧手段になる。
+    saveCurrentAsVersion(`外来形式に変換する前（${versionStamp()}）`);
+
     const newData: Record<number, (string | null)[]> = JSON.parse(JSON.stringify(schedule.data));
     let offConverted = 0;
     let satConverted = 0;
@@ -3805,12 +3853,11 @@ const WardScheduleSystem = () => {
         const day = d + 1;
         const cur = shifts[d];
         if (!cur) continue;  // 空セル（生成除外の職員など）は対象外
-        if (cur === '休') {
-          if (closedDaySet.has(day)) continue;  // 休診日の休は公休として残す
-          shifts[d] = FULL_DAY_OFF_SYMBOL;
+        if (cur === INTERNAL_OFF_LABEL) {
+          shifts[d] = CWS_FULL_DAY_OFF_SYMBOL;
           offConverted++;
-        } else if (cur === '日' && new Date(targetYear, targetMonth, day).getDay() === 6) {
-          shifts[d] = '午後半';
+        } else if (cur === INTERNAL_FULL_DAY_LABEL && new Date(targetYear, targetMonth, day).getDay() === 6) {
+          shifts[d] = CWS_SATURDAY_SYMBOL;
           satConverted++;
         }
       }
@@ -3821,7 +3868,62 @@ const WardScheduleSystem = () => {
     saveWithStatus(async () => {
       await saveSchedulesToDB(targetYear, targetMonth, newData);
     });
-    setConversionResult({ month: monthKey, nurses: targets.length, off: offConverted, sat: satConverted });
+    setConversionResult({ month: monthKey, nurses: targets.length, off: offConverted, sat: satConverted, direction: 'toCws' });
+  };
+
+  // ============================================
+  // 外来形式（CWS）からの逆変換
+  // ============================================
+  // convertToOutpatientFormat が書いた2記号だけを内部ラベルへ戻す。
+  //   公  → 休
+  //   /ﾊ → 日
+  // それ以外のセルには一切触れない。特に職員が希望として入力した半休ラベル
+  // （午前半 / 午後半）は CWS 記号ではないため対象外で、そのまま残る。
+  // 記号・ラベルはすべて正変換と同じ定数を参照する（手入力しない）。
+  const revertFromOutpatientFormat = () => {
+    const monthKey = `${targetYear}-${targetMonth}`;
+    if (!schedule || schedule.month !== monthKey) { alert('勤務表が生成されていません'); return; }
+    const targets = cwsConvertTargets;
+    if (targets.length === 0) { alert('「半休で消化」が有効な職員がいません（職員別シフト設定で確認してください）'); return; }
+    if (!hasCwsSymbolsInMonth) { alert(`戻せるセルがありません（「${CWS_FULL_DAY_OFF_SYMBOL}」「${CWS_SATURDAY_SYMBOL}」が見つかりません）`); return; }
+
+    if (!confirm(
+      `${targets.length}名の勤務表を外来形式から元に戻します。\n` +
+      `「${CWS_FULL_DAY_OFF_SYMBOL}」を「${INTERNAL_OFF_LABEL}」に、「${CWS_SATURDAY_SYMBOL}」を「${INTERNAL_FULL_DAY_LABEL}」に戻します。\n\n` +
+      `⚠️ この操作はデータベースに書き込みます（表示だけの変更ではありません）。\n` +
+      `変換前の状態はバージョンとして自動保存されるため、履歴から復元できます。\n\n` +
+      `※上記2記号以外のセルは変更しません（職員が入力した半休希望もそのまま残ります）。\n` +
+      `※「半休で消化」がオフの職員は変換しません。`
+    )) return;
+
+    // newData を変更する前に、変換前の状態をバージョンとして自動保存する（正変換と同じ経路）。
+    saveCurrentAsVersion(`CWS形式から戻す前（${versionStamp()}）`);
+
+    const newData: Record<number, (string | null)[]> = JSON.parse(JSON.stringify(schedule.data));
+    let offReverted = 0;
+    let satReverted = 0;
+
+    targets.forEach(n => {
+      const shifts = newData[n.id];
+      if (!Array.isArray(shifts)) return;
+      for (let d = 0; d < daysInMonth; d++) {
+        const cur = shifts[d];
+        if (cur === CWS_FULL_DAY_OFF_SYMBOL) {
+          shifts[d] = INTERNAL_OFF_LABEL;
+          offReverted++;
+        } else if (cur === CWS_SATURDAY_SYMBOL) {
+          shifts[d] = INTERNAL_FULL_DAY_LABEL;
+          satReverted++;
+        }
+      }
+    });
+
+    setSchedule((prev: any) => ({ ...prev, data: newData }));
+    saveScheduleToLocalStorage(newData);
+    saveWithStatus(async () => {
+      await saveSchedulesToDB(targetYear, targetMonth, newData);
+    });
+    setConversionResult({ month: monthKey, nurses: targets.length, off: offReverted, sat: satReverted, direction: 'fromCws' });
   };
 
   // Excel出力（カラー対応）
@@ -6292,7 +6394,7 @@ const WardScheduleSystem = () => {
               </button>
               {schedule && (
                 <button
-                  onClick={saveCurrentAsVersion}
+                  onClick={() => saveCurrentAsVersion()}
                   className="px-4 py-2 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded-xl flex items-center gap-2 transition-colors border border-blue-200"
                 >
                   <Save size={18} />
@@ -6766,11 +6868,22 @@ const WardScheduleSystem = () => {
                 <button
                   onClick={convertToOutpatientFormat}
                   disabled={!schedule}
-                  title={`休みを「${FULL_DAY_OFF_SYMBOL}」に、土曜の日勤を「午後半」に置き換えます（休診日の休はそのまま）`}
+                  title={`休みを「${CWS_FULL_DAY_OFF_SYMBOL}」に、土曜の日勤を「${CWS_SATURDAY_SYMBOL}」に置き換えます（休診日の休も対象）`}
                   className={`bg-amber-500 hover:bg-amber-600 text-white rounded-lg flex items-center gap-1 transition-colors disabled:opacity-50 ${isMaximized ? 'px-2 py-1 text-xs' : 'px-4 py-2'}`}
                 >
                   <Edit2 size={isMaximized ? 14 : 18} />
                   外来形式に変換
+                </button>
+                <button
+                  onClick={revertFromOutpatientFormat}
+                  disabled={!schedule || !hasCwsSymbolsInMonth}
+                  title={hasCwsSymbolsInMonth
+                    ? `「${CWS_FULL_DAY_OFF_SYMBOL}」を「${INTERNAL_OFF_LABEL}」に、「${CWS_SATURDAY_SYMBOL}」を「${INTERNAL_FULL_DAY_LABEL}」に戻します（他のセルは変更しません）`
+                    : '戻せるセルがありません（外来形式の記号が当月にありません）'}
+                  className={`bg-slate-500 hover:bg-slate-600 text-white rounded-lg flex items-center gap-1 transition-colors disabled:opacity-50 ${isMaximized ? 'px-2 py-1 text-xs' : 'px-4 py-2'}`}
+                >
+                  <Undo2 size={isMaximized ? 14 : 18} />
+                  元の形式に戻す
                 </button>
               </div>
             </div>
@@ -6778,9 +6891,11 @@ const WardScheduleSystem = () => {
             {/* 外来形式への変換結果（最大化時は非表示） */}
             {!isMaximized && conversionResult && conversionResult.month === `${targetYear}-${targetMonth}` && (
               <div className="bg-amber-50 border border-amber-200 rounded-xl p-3 mb-4 text-sm text-amber-800">
-                <strong>✅ 外来形式に変換しました（{conversionResult.nurses}名）：</strong>
-                {` 休 → ${FULL_DAY_OFF_SYMBOL}: ${conversionResult.off}件 / 土曜の 日 → 午後半: ${conversionResult.sat}件`}
-                {conversionResult.off === 0 && conversionResult.sat === 0 && '（変換対象のセルはありませんでした）'}
+                <strong>{conversionResult.direction === 'toCws' ? '✅ 外来形式に変換しました' : '↩️ 外来形式から元に戻しました'}（{conversionResult.nurses}名）：</strong>
+                {conversionResult.direction === 'toCws'
+                  ? ` ${INTERNAL_OFF_LABEL} → ${CWS_FULL_DAY_OFF_SYMBOL}: ${conversionResult.off}件 / 土曜の ${INTERNAL_FULL_DAY_LABEL} → ${CWS_SATURDAY_SYMBOL}: ${conversionResult.sat}件`
+                  : ` ${CWS_FULL_DAY_OFF_SYMBOL} → ${INTERNAL_OFF_LABEL}: ${conversionResult.off}件 / ${CWS_SATURDAY_SYMBOL} → ${INTERNAL_FULL_DAY_LABEL}: ${conversionResult.sat}件`}
+                {conversionResult.off === 0 && conversionResult.sat === 0 && '（対象のセルはありませんでした）'}
               </div>
             )}
 
@@ -8492,7 +8607,7 @@ const WardScheduleSystem = () => {
                     未設定の場合は共通設定（最大{generateConfig.maxNightShifts}回）が適用されます。
                     「希望上限」は職員が入力できる希望数の上限です（0=無制限）。明・管明は自動設定のためカウントに含まれません。
                     生成除外にチェックすると自動生成の対象外になります（手動でシフトを入力してください）。カスタムシフト（研修・出張等）はダッシュボードの「シフト種類」から追加できます。
-                    「半休で消化」は勤務表の「外来形式に変換」で休みを「{FULL_DAY_OFF_SYMBOL}」に置き換える対象かどうかです（既定オン。オフの職員は「休」のまま残ります）。
+                    「半休で消化」は勤務表の「外来形式に変換」で休みを「{CWS_FULL_DAY_OFF_SYMBOL}」に置き換える対象かどうかです（既定オン。オフの職員は「休」のまま残ります）。
                   </p>
                 </div>
 
@@ -9619,6 +9734,9 @@ const WardScheduleSystem = () => {
                               <span className="font-bold text-indigo-700">v{ver.version}</span>
                               <span className="text-sm text-gray-500 ml-3">{dateStr}</span>
                               <span className="text-sm text-gray-400 ml-3">{staffCount}名分</span>
+                              {ver.label && (
+                                <span className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded px-2 py-0.5 ml-3">{ver.label}</span>
+                              )}
                             </div>
                             <div className="flex gap-2">
                               <button
