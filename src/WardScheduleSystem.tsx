@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo, useRef } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useMemo, useRef } from 'react';
 import { Calendar, CalendarDays, Settings, Moon, Sun, Clock, RefreshCw, AlertCircle, CheckCircle, Plus, Trash2, LogOut, Lock, Download, Upload, Edit2, Save, X, Eye, Users, FileSpreadsheet, Activity, Maximize2, Minimize2, ChevronUp, ChevronDown, RotateCcw, History, BarChart3, UserX, List, Shield, GripVertical } from 'lucide-react';
 import * as XLSX from 'xlsx-js-style';
 import { supabase } from './lib/supabase';
@@ -291,6 +291,193 @@ interface ScheduleVersion {
   data: Record<number, (string | null)[]>;
 }
 
+// 夜勤の自動補完の解除: 「夜」「管夜」から別の記号へ変えたとき、自動セットされた
+// 翌日の明系と翌々日の休を取り消す。職員入力の①をそのまま共用する。
+// ※ otherNightBefore の条件は (d2 - 2) === day のため常に false になるが、
+//    職員入力の挙動を変えないため既存ロジックのまま移設している。
+const clearNightChain = (
+  nurseRequests: Record<string | number, any>,
+  day: number,
+  currentValue: string | null,
+  daysInMonth: number,
+  dbChanges: Record<number, string | null>
+) => {
+  if (currentValue !== '夜' && currentValue !== '管夜') return;
+  const akeType = currentValue === '夜' ? '明' : '管明';
+  if (day + 1 <= daysInMonth && nurseRequests[day + 1] === akeType) {
+    delete nurseRequests[day + 1];
+    dbChanges[day + 1] = null;
+  }
+  if (day + 2 <= daysInMonth && nurseRequests[day + 2] === '休') {
+    const d2 = day + 2;
+    const otherNightBefore = d2 >= 2 && (nurseRequests[d2 - 2] === '夜' || nurseRequests[d2 - 2] === '管夜') && (d2 - 2) !== day;
+    if (!otherNightBefore) {
+      delete nurseRequests[day + 2];
+      dbChanges[day + 2] = null;
+    }
+  }
+};
+
+// 夜勤の自動補完: 夜→翌日 明・翌々日 休 / 管夜→翌日 管明・翌々日 休。
+// 翌日・翌々日が「空のときだけ」書き込み、既存の値は上書きしない。
+// day + 1 / day + 2 が月末を超える場合は書き込まない（翌月に行を作らない）。
+// 職員入力(handleStaffRequestClick)と希望一覧のインライン編集で共用する。
+const applyNightChain = (
+  nurseRequests: Record<string | number, any>,
+  day: number,
+  newValue: string | null,
+  daysInMonth: number,
+  dbChanges: Record<number, string | null>
+) => {
+  if (newValue !== '夜' && newValue !== '管夜') return;
+  const akeType = newValue === '夜' ? '明' : '管明';
+  if (day + 1 <= daysInMonth && !nurseRequests[day + 1]) {
+    nurseRequests[day + 1] = akeType;
+    dbChanges[day + 1] = akeType;
+  }
+  if (day + 2 <= daysInMonth && !nurseRequests[day + 2]) {
+    nurseRequests[day + 2] = '休';
+    dbChanges[day + 2] = '休';
+  }
+};
+
+// シフト選択ポップオーバー（勤務表グリッドと希望一覧で共用）
+// 表示のみを担当し、選択結果は onSelect / onClose で呼び出し側に返す。
+const ShiftPickerPopover = ({
+  title, currentShift, x, y, anchorTop, allShifts, customShifts, onSelect, onClose,
+}: {
+  title: string;
+  currentShift: string | null;
+  x: number;          // アンカーの左端（viewport 座標）
+  y: number;          // アンカーの下端（viewport 座標）
+  anchorTop?: number; // アンカーの上端。指定時のみビューポート内に収める新方式を使う
+  allShifts: Record<string, any>;
+  customShifts: CustomShift[];
+  onSelect: (symbol: string | null) => void;
+  onClose: () => void;
+}) => {
+  const systemShiftButtons = [
+    { symbol: '日', name: '日勤' },
+    { symbol: '夜', name: '夜勤' },
+    { symbol: '管夜', name: '管夜' },
+    { symbol: '休', name: '公休' },
+    { symbol: '有', name: '有休' },
+    { symbol: '午前半', name: '午前半休' },
+    { symbol: '午後半', name: '午後半休' },
+  ];
+
+  const popX = Math.min(x, window.innerWidth - 320);
+  const popY = y + window.scrollY;
+  const showAbove = y > window.innerHeight - 250;
+
+  // anchorTop が渡された場合は、実寸を測ってビューポート内に必ず収める。
+  // （position:fixed は viewport 基準なので scrollY を足してはいけない。
+  //   旧方式は勤務表グリッド専用として温存し、挙動を変えない。）
+  const clampToViewport = anchorTop !== undefined;
+  const panelRef = useRef<HTMLDivElement>(null);
+  const [clampedPos, setClampedPos] = useState<{ left: number; top: number } | null>(null);
+
+  useLayoutEffect(() => {
+    if (!clampToViewport) return;
+    const el = panelRef.current;
+    if (!el) return;
+    const M = 8; // ビューポート端の余白
+    const w = el.offsetWidth;
+    const h = el.offsetHeight;
+    // 横: 右端でも左端でもはみ出さないようにクランプ
+    const left = Math.max(M, Math.min(x, window.innerWidth - w - M));
+    // 縦: 下に入らなければアンカーの上へ反転。それでも入らなければ下端に寄せる
+    let top = y + 4;
+    if (top + h > window.innerHeight - M) {
+      const above = (anchorTop as number) - h - 4;
+      top = above >= M ? above : Math.max(M, window.innerHeight - h - M);
+    }
+    setClampedPos({ left, top });
+  }, [clampToViewport, x, y, anchorTop, customShifts.length]);
+
+  return (
+    <>
+      <div
+        className="fixed inset-0 z-40"
+        onClick={onClose}
+      />
+      <div
+        ref={panelRef}
+        className="fixed z-50 bg-white rounded-xl shadow-2xl border-2 border-gray-200 p-3 w-[280px]"
+        style={clampToViewport ? {
+          left: `${clampedPos ? clampedPos.left : x}px`,
+          top: `${clampedPos ? clampedPos.top : y + 4}px`,
+          // 実寸を測るまでの1フレームのちらつきを防ぐ
+          visibility: clampedPos ? 'visible' : 'hidden',
+        } : {
+          left: `${popX}px`,
+          top: showAbove ? undefined : `${popY + 4}px`,
+          bottom: showAbove ? `${window.innerHeight - y + window.scrollY + 4}px` : undefined,
+        }}
+      >
+        <div className="flex justify-between items-center mb-2">
+          <span className="text-xs text-gray-500 font-medium">
+            {title}
+          </span>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 text-xs">✕</button>
+        </div>
+
+        <div className="text-xs text-gray-400 mb-2">
+          現在: <span className={`font-bold ${allShifts[currentShift || '']?.color || 'text-gray-300'}`}>{currentShift || '空白'}</span>
+        </div>
+
+        <div className="grid grid-cols-4 gap-1 mb-2">
+          {systemShiftButtons.map(btn => (
+            <button
+              key={btn.symbol}
+              onClick={() => onSelect(btn.symbol)}
+              className={`px-1 py-2 rounded-lg text-xs font-bold transition-all hover:scale-105 ${
+                currentShift === btn.symbol
+                  ? 'ring-2 ring-blue-500 ' + (allShifts[btn.symbol]?.color || '')
+                  : (allShifts[btn.symbol]?.color || 'bg-gray-100')
+              }`}
+              title={btn.name}
+            >
+              {btn.symbol}
+            </button>
+          ))}
+        </div>
+
+        {customShifts.length > 0 && (
+          <>
+            <div className="text-[10px] text-gray-400 mb-1">その他</div>
+            <div className="grid grid-cols-4 gap-1 mb-2">
+              {customShifts.map(cs => (
+                <button
+                  key={cs.symbol}
+                  onClick={() => onSelect(cs.symbol)}
+                  className={`px-1 py-2 rounded-lg text-xs font-bold transition-all hover:scale-105 ${
+                    currentShift === cs.symbol
+                      ? 'ring-2 ring-blue-500 ' + (allShifts[cs.symbol]?.color || '')
+                      : (allShifts[cs.symbol]?.color || 'bg-gray-100')
+                  }`}
+                  title={cs.name}
+                >
+                  {cs.symbol}
+                </button>
+              ))}
+            </div>
+          </>
+        )}
+
+        <div className="flex gap-1">
+          <button
+            onClick={() => onSelect(null)}
+            className="flex-1 px-2 py-1.5 bg-gray-100 hover:bg-gray-200 rounded-lg text-xs text-gray-600 transition-colors"
+          >
+            クリア
+          </button>
+        </div>
+      </div>
+    </>
+  );
+};
+
 // ============================================
 // メインコンポーネント
 // ============================================
@@ -330,9 +517,31 @@ const WardScheduleSystem = () => {
   // ローディング状態
   const [isLoading, setIsLoading] = useState(true);
 
-  // 対象年月
-  const [targetYear, setTargetYear] = useState(new Date().getFullYear());
-  const [targetMonth, setTargetMonth] = useState(new Date().getMonth());
+  // 対象年月（localStorage に永続化）
+  // リロードで当月に戻ると、翌月分として入力済みの希望が画面から消えたように
+  // 見えるため、最後に選んだ年月を復元する。
+  // month は 0〜11 の JS 形式。DB の month 列と同じ 0 基準のまま保存する。
+  const targetPeriodKey = `${dbPrefix}-target-period`;
+  const readStoredPeriod = () => {
+    const now = new Date();
+    const fallback = { year: now.getFullYear(), month: now.getMonth() };
+    try {
+      const raw = localStorage.getItem(targetPeriodKey);
+      if (!raw) return fallback;
+      const parsed = JSON.parse(raw);
+      const y = parsed?.year;
+      const m = parsed?.month;
+      // 壊れた値・範囲外は無視して当月にフォールバックする
+      if (!Number.isInteger(y) || y < 2000 || y > 2100) return fallback;
+      if (!Number.isInteger(m) || m < 0 || m > 11) return fallback;
+      return { year: y, month: m };
+    } catch (e) {
+      console.error('対象年月の読み込みエラー:', e);
+      return fallback;
+    }
+  };
+  const [targetYear, setTargetYear] = useState(() => readStoredPeriod().year);
+  const [targetMonth, setTargetMonth] = useState(() => readStoredPeriod().month);
   
   // 看護師データ（Supabase永続化）
   const [nurses, setNurses] = useState<any[]>([]);
@@ -367,6 +576,8 @@ const WardScheduleSystem = () => {
   const [dragOverNurseId, setDragOverNurseId] = useState<number | null>(null); // ドロップ先ハイライト対象
   const [newNurseData, setNewNurseData] = useState({ name: '', position: '一般', job_type: DEFAULT_JOB_TYPE });
   const [editingCell, setEditingCell] = useState<{ nurseId: number; dayIndex: number; x: number; y: number } | null>(null);
+  // 希望一覧モーダルのインライン編集（管理者のみ）。day は 1-based。
+  const [editingRequestCell, setEditingRequestCell] = useState<{ nurseId: number; day: number; x: number; y: number; top: number } | null>(null);
   const [generating, setGenerating] = useState(false);
   const [generatingPhase, setGeneratingPhase] = useState('');
   const [generatedPatterns, setGeneratedPatterns] = useState<any[]>([]);
@@ -486,17 +697,33 @@ const WardScheduleSystem = () => {
     return validShifts.includes(str) ? str : null;
   };
 
+  // 対象年月の変更を localStorage に保存する。
+  // ダッシュボードの月カード・年月セレクタなど、どの経路で変更されても
+  // 確実に永続化されるよう state の変更を1か所で拾う。
+  useEffect(() => {
+    try {
+      localStorage.setItem(targetPeriodKey, JSON.stringify({ year: targetYear, month: targetMonth }));
+    } catch (e) {
+      console.error('対象年月の保存エラー:', e);
+    }
+  }, [targetYear, targetMonth]);
+
   // Supabaseからデータ読み込み
   useEffect(() => {
+    // 月を切り替えると本 effect が再実行される。先行する実行が後から解決して
+    // 新しい月のデータを古い月で上書きしないよう、最新の実行だけが反映する。
+    let cancelled = false;
     const loadData = async () => {
       try {
         setIsLoading(true);
         const dbNurses = await fetchNursesFromDB();
+        if (cancelled) return;
         if (dbNurses.length > 0) {
           // job_type 未設定（既存データ / null）は「看護師」として扱う
           setNurses(dbNurses.map((n: any) => ({ ...n, job_type: getJobType(n) })));
         }
         const dbRequests = await fetchRequestsFromDB(targetYear, targetMonth);
+        if (cancelled) return;
         const reqMap: Record<string, any> = {};
         dbRequests.forEach((r: any) => {
           const monthKey = `${r.year}-${r.month}`;
@@ -507,6 +734,7 @@ const WardScheduleSystem = () => {
         setRequests(reqMap);
 
         const dbSchedules = await fetchSchedulesFromDB(targetYear, targetMonth);
+        if (cancelled) return;
         if (dbSchedules.length > 0) {
           const days = getDaysInMonth(targetYear, targetMonth);
           const schedData: Record<number, (string | null)[]> = {};
@@ -538,6 +766,7 @@ const WardScheduleSystem = () => {
         // 前月データの読み込み（月別キーで保存）
         const pmKey = `prevMonth-${targetYear}-${targetMonth}`;
         const savedPrevData = await fetchSettingFromDB(pmKey);
+        if (cancelled) return;
         if (savedPrevData) {
           try {
             const parsed = JSON.parse(savedPrevData);
@@ -664,11 +893,14 @@ const WardScheduleSystem = () => {
       } catch (error: any) {
         console.error('データ読み込みエラー:', error);
       } finally {
-        setSettingsLoaded(true);
-        setIsLoading(false);
+        if (!cancelled) {
+          setSettingsLoaded(true);
+          setIsLoading(false);
+        }
       }
     };
     loadData();
+    return () => { cancelled = true; };
   }, [targetYear, targetMonth]);
 
   // === 設定の autosave（500ms debounce）===
@@ -762,15 +994,15 @@ const WardScheduleSystem = () => {
 
   // ポップオーバーが開いている時、スクロールやリサイズで閉じる
   useEffect(() => {
-    if (!editingCell) return;
-    const close = () => setEditingCell(null);
+    if (!editingCell && !editingRequestCell) return;
+    const close = () => { setEditingCell(null); setEditingRequestCell(null); };
     window.addEventListener('scroll', close, true);
     window.addEventListener('resize', close);
     return () => {
       window.removeEventListener('scroll', close, true);
       window.removeEventListener('resize', close);
     };
-  }, [editingCell]);
+  }, [editingCell, editingRequestCell]);
 
   // 保存ラッパー関数（保存状態管理 + LocalStorageバックアップ）
   const saveWithStatus = async (saveFn: () => Promise<void>) => {
@@ -793,7 +1025,7 @@ const WardScheduleSystem = () => {
   // LocalStorageバックアップ保存
   const saveScheduleToLocalStorage = (scheduleData: any) => {
     try {
-      const key = `hcu-schedule-backup-${targetYear}-${targetMonth}`;
+      const key = `${dbPrefix}-schedule-backup-${targetYear}-${targetMonth}`;
       localStorage.setItem(key, JSON.stringify(scheduleData));
     } catch (e) {
       console.error('LocalStorage保存エラー:', e);
@@ -803,7 +1035,7 @@ const WardScheduleSystem = () => {
   // LocalStorageバックアップ復元
   const loadScheduleFromLocalStorage = () => {
     try {
-      const key = `hcu-schedule-backup-${targetYear}-${targetMonth}`;
+      const key = `${dbPrefix}-schedule-backup-${targetYear}-${targetMonth}`;
       const data = localStorage.getItem(key);
       return data ? JSON.parse(data) : null;
     } catch (e) {
@@ -815,7 +1047,7 @@ const WardScheduleSystem = () => {
   // LocalStorageバックアップ削除
   const clearScheduleFromLocalStorage = () => {
     try {
-      const key = `hcu-schedule-backup-${targetYear}-${targetMonth}`;
+      const key = `${dbPrefix}-schedule-backup-${targetYear}-${targetMonth}`;
       localStorage.removeItem(key);
     } catch (e) {
       console.error('LocalStorage削除エラー:', e);
@@ -885,6 +1117,62 @@ const WardScheduleSystem = () => {
     }
   };
 
+  // 希望一覧モーダルからの1セル編集（管理者用）。
+  // 保存は職員入力と同じ saveRequestToDB を使い、DB書き込み経路は増やさない。
+  // 夜勤の自動補完/解除は職員入力と同じ applyNightChain / clearNightChain を使う。
+  // 「クリア」は選択セルのみを消す（翌日以降には触れない）。
+  const applyRequestFromPalette = (nurseId: number, day: number, newValue: string | null) => {
+    const monthKey = `${targetYear}-${targetMonth}`;
+    const nurseIdKey = String(nurseId);
+    const days = getDaysInMonth(targetYear, targetMonth);
+    const oldValue = requests[monthKey]?.[nurseIdKey]?.[day] ?? null;
+    setEditingRequestCell(null);
+    if (oldValue === newValue) return;
+
+    // 変更内容を先に確定させてから state と DB に反映する
+    // （setRequests のupdater内で外側の変数を書き換えると保存時に間に合わない）
+    const nurseRequests: Record<string | number, any> = { ...(requests[monthKey]?.[nurseIdKey] || {}) };
+    const dbChanges: Record<number, string | null> = {};
+
+    // ① 「夜」「管夜」から別の記号へ変更 → 自動セットされた明系・休を解除。
+    //    「クリア」は選択セルのみを消す仕様のため対象外とする。
+    if (newValue !== null) {
+      clearNightChain(nurseRequests, day, oldValue, days, dbChanges);
+    }
+
+    // ② セル値更新
+    if (newValue) {
+      nurseRequests[day] = newValue;
+    } else {
+      delete nurseRequests[day];
+    }
+    dbChanges[day] = newValue;
+
+    // ③ 夜勤の自動補完
+    applyNightChain(nurseRequests, day, newValue, days, dbChanges);
+
+    setRequests((prev: any) => ({
+      ...prev,
+      [monthKey]: { ...(prev[monthKey] || {}), [nurseIdKey]: nurseRequests },
+    }));
+
+    saveWithStatus(async () => {
+      for (const [d, val] of Object.entries(dbChanges)) {
+        await saveRequestToDB(nurseId, targetYear, targetMonth, Number(d), val);
+      }
+    });
+
+    const targetNurse = nurses.find(n => n.id === nurseId);
+    insertAuditLog({
+      action: 'request_change',
+      user_type: 'admin',
+      nurse_id: nurseId,
+      nurse_name: targetNurse?.name,
+      year: targetYear, month: targetMonth, day,
+      old_value: oldValue || '', new_value: newValue || '',
+    });
+  };
+
   // 計算値
   const activeNurses = useMemo(() =>
     nurses.filter(n => n.active).sort((a, b) =>
@@ -898,6 +1186,8 @@ const WardScheduleSystem = () => {
     () => getClosedDays(targetYear, targetMonth, closedDaysConfig),
     [targetYear, targetMonth, closedDaysConfig]
   );
+  // 希望一覧のセル判定用（O(1) 参照）
+  const closedDaySet = useMemo(() => new Set(closedDays), [closedDays]);
 
   // 各看護師にアクセスコードを付与
   const nursesWithCodes = useMemo(() =>
@@ -3896,21 +4186,7 @@ const WardScheduleSystem = () => {
       }
 
       // ① 「夜」or「管夜」解除時 → 自動セットした明系・休のみクリア
-      if (currentRequest === '夜' || currentRequest === '管夜') {
-        const akeType = currentRequest === '夜' ? '明' : '管明';
-        if (day + 1 <= days && nurseRequests[day + 1] === akeType) {
-          delete nurseRequests[day + 1];
-          dbChanges[day + 1] = null;
-        }
-        if (day + 2 <= days && nurseRequests[day + 2] === '休') {
-          const d2 = day + 2;
-          const otherNightBefore = d2 >= 2 && (nurseRequests[d2 - 2] === '夜' || nurseRequests[d2 - 2] === '管夜') && (d2 - 2) !== day;
-          if (!otherNightBefore) {
-            delete nurseRequests[day + 2];
-            dbChanges[day + 2] = null;
-          }
-        }
-      }
+      clearNightChain(nurseRequests, day, currentRequest, days, dbChanges);
 
       // ② セル値更新
       if (newValue) {
@@ -3921,17 +4197,7 @@ const WardScheduleSystem = () => {
       dbChanges[day] = newValue;
 
       // ③ 新しく「夜」or「管夜」→ 翌日・翌々日が空の場合のみ自動セット
-      if (newValue === '夜' || newValue === '管夜') {
-        const akeType = newValue === '夜' ? '明' : '管明';
-        if (day + 1 <= days && !nurseRequests[day + 1]) {
-          nurseRequests[day + 1] = akeType;
-          dbChanges[day + 1] = akeType;
-        }
-        if (day + 2 <= days && !nurseRequests[day + 2]) {
-          nurseRequests[day + 2] = '休';
-          dbChanges[day + 2] = '休';
-        }
-      }
+      applyNightChain(nurseRequests, day, newValue, days, dbChanges);
 
       monthRequests[nurseIdKey] = nurseRequests;
       return { ...prev, [monthKey]: monthRequests };
@@ -6785,95 +7051,17 @@ const WardScheduleSystem = () => {
             {editingCell && (() => {
               const nurse = activeNurses.find(n => n.id === editingCell.nurseId);
               const currentShift = sanitizeShiftLocal(scheduleDisplayData[editingCell.nurseId]?.[editingCell.dayIndex]);
-
-              const systemShiftButtons = [
-                { symbol: '日', name: '日勤' },
-                { symbol: '夜', name: '夜勤' },
-                { symbol: '管夜', name: '管夜' },
-                { symbol: '休', name: '公休' },
-                { symbol: '有', name: '有休' },
-                { symbol: '午前半', name: '午前半休' },
-                { symbol: '午後半', name: '午後半休' },
-              ];
-
-              const popX = Math.min(editingCell.x, window.innerWidth - 320);
-              const popY = editingCell.y + window.scrollY;
-              const showAbove = editingCell.y > window.innerHeight - 250;
-
               return (
-                <>
-                  <div
-                    className="fixed inset-0 z-40"
-                    onClick={() => setEditingCell(null)}
-                  />
-                  <div
-                    className="fixed z-50 bg-white rounded-xl shadow-2xl border-2 border-gray-200 p-3 w-[280px]"
-                    style={{
-                      left: `${popX}px`,
-                      top: showAbove ? undefined : `${popY + 4}px`,
-                      bottom: showAbove ? `${window.innerHeight - editingCell.y + window.scrollY + 4}px` : undefined,
-                    }}
-                  >
-                    <div className="flex justify-between items-center mb-2">
-                      <span className="text-xs text-gray-500 font-medium">
-                        {nurse?.name} - {editingCell.dayIndex + 1}日
-                      </span>
-                      <button onClick={() => setEditingCell(null)} className="text-gray-400 hover:text-gray-600 text-xs">✕</button>
-                    </div>
-
-                    <div className="text-xs text-gray-400 mb-2">
-                      現在: <span className={`font-bold ${allShifts[currentShift || '']?.color || 'text-gray-300'}`}>{currentShift || '空白'}</span>
-                    </div>
-
-                    <div className="grid grid-cols-4 gap-1 mb-2">
-                      {systemShiftButtons.map(btn => (
-                        <button
-                          key={btn.symbol}
-                          onClick={() => applyShiftFromPalette(editingCell.nurseId, editingCell.dayIndex, btn.symbol)}
-                          className={`px-1 py-2 rounded-lg text-xs font-bold transition-all hover:scale-105 ${
-                            currentShift === btn.symbol
-                              ? 'ring-2 ring-blue-500 ' + (allShifts[btn.symbol]?.color || '')
-                              : (allShifts[btn.symbol]?.color || 'bg-gray-100')
-                          }`}
-                          title={btn.name}
-                        >
-                          {btn.symbol}
-                        </button>
-                      ))}
-                    </div>
-
-                    {customShifts.length > 0 && (
-                      <>
-                        <div className="text-[10px] text-gray-400 mb-1">その他</div>
-                        <div className="grid grid-cols-4 gap-1 mb-2">
-                          {customShifts.map(cs => (
-                            <button
-                              key={cs.symbol}
-                              onClick={() => applyShiftFromPalette(editingCell.nurseId, editingCell.dayIndex, cs.symbol)}
-                              className={`px-1 py-2 rounded-lg text-xs font-bold transition-all hover:scale-105 ${
-                                currentShift === cs.symbol
-                                  ? 'ring-2 ring-blue-500 ' + (allShifts[cs.symbol]?.color || '')
-                                  : (allShifts[cs.symbol]?.color || 'bg-gray-100')
-                              }`}
-                              title={cs.name}
-                            >
-                              {cs.symbol}
-                            </button>
-                          ))}
-                        </div>
-                      </>
-                    )}
-
-                    <div className="flex gap-1">
-                      <button
-                        onClick={() => applyShiftFromPalette(editingCell.nurseId, editingCell.dayIndex, null)}
-                        className="flex-1 px-2 py-1.5 bg-gray-100 hover:bg-gray-200 rounded-lg text-xs text-gray-600 transition-colors"
-                      >
-                        クリア
-                      </button>
-                    </div>
-                  </div>
-                </>
+                <ShiftPickerPopover
+                  title={`${nurse?.name} - ${editingCell.dayIndex + 1}日`}
+                  currentShift={currentShift}
+                  x={editingCell.x}
+                  y={editingCell.y}
+                  allShifts={allShifts}
+                  customShifts={customShifts}
+                  onSelect={(symbol) => applyShiftFromPalette(editingCell.nurseId, editingCell.dayIndex, symbol)}
+                  onClose={() => setEditingCell(null)}
+                />
               );
             })()}
 
@@ -7369,7 +7557,7 @@ const WardScheduleSystem = () => {
                   </button>
                   <button
                     onClick={async () => {
-                      if (!confirm('⚠️ この月の全職員の希望データをDBから完全に削除しますか？\n\n削除後、職員に再入力を依頼してください。')) return;
+                      if (!confirm(`⚠️ ${targetYear}年${targetMonth + 1}月の希望 ${totalRequests}件 を全職員分DBから完全に削除しますか？\n\nこの操作は取り消せません。削除後、職員に再入力を依頼してください。`)) return;
                       try {
                         const { error } = await supabase.from(getTableName('requests')).delete()
                           .eq('year', targetYear).eq('month', targetMonth);
@@ -7379,7 +7567,11 @@ const WardScheduleSystem = () => {
                           delete updated[`${targetYear}-${targetMonth}`];
                           return updated;
                         });
-                        setOriginalRequests({});
+                        setOriginalRequests((prev: any) => {
+                          const updated = { ...prev };
+                          delete updated[`${targetYear}-${targetMonth}`];
+                          return updated;
+                        });
                         alert('✅ 全希望データを削除しました。');
                       } catch (e: any) {
                         alert('❌ 削除エラー: ' + (e?.message || '不明'));
@@ -7398,7 +7590,7 @@ const WardScheduleSystem = () => {
 
               <div className="bg-blue-50 border border-blue-200 rounded-xl p-3 mb-4">
                 <p className="text-sm text-blue-800">
-                  <strong>💡 確認専用：</strong>希望の編集は勤務表画面で直接行ってください。ここでは確認と一括消去のみ可能です。
+                  <strong>💡 編集できます：</strong>セルをクリックするとシフト選択が開き、選んだ内容がそのまま保存されます。「クリア」で希望を取り消せます。前月引継ぎ・休診日のセルは編集できません。
                 </p>
               </div>
 
@@ -7471,11 +7663,22 @@ const WardScheduleSystem = () => {
                                   .map(c => c.message)
                                   .join('\n')
                               : undefined;
+                            const isEditingThis = editingRequestCell?.nurseId === nurse.id && editingRequestCell?.day === day;
+                            // 休診日は buildSolverRequest で全職員 '休' に上書きされるため、希望を入れても
+                            // 生成時に必ず消える。前月制約日と同じくクリック不可にして入力させない。
+                            const isClosedDay = closedDaySet.has(day);
+                            // 編集可: 管理者 かつ 前月引継ぎセルでない かつ 休診日でない
+                            const isEditable = isAdminAuth && !con && !isClosedDay;
                             return (
                               <td
                                 key={day}
                                 title={conflictTip}
-                                className={`border p-1 text-center ${isConflict ? 'ring-2 ring-red-500 ring-inset' : ''} ${
+                                onClick={isEditable ? (e) => {
+                                  if (isEditingThis) { setEditingRequestCell(null); return; }
+                                  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+                                  setEditingRequestCell({ nurseId: nurse.id, day, x: rect.left, y: rect.bottom, top: rect.top });
+                                } : undefined}
+                                className={`border p-1 text-center ${isEditable ? 'cursor-pointer hover:ring-2 hover:ring-blue-300 hover:ring-inset' : ''} ${isEditingThis ? 'ring-2 ring-blue-500 ring-inset' : ''} ${isConflict ? 'ring-2 ring-red-500 ring-inset' : ''} ${
                                 req === '休' ? 'bg-gray-200' :
                                 req === '有' ? 'bg-emerald-100' :
                                 req === '前' ? 'bg-orange-100' :
@@ -7515,6 +7718,24 @@ const WardScheduleSystem = () => {
                   </tbody>
                 </table>
               </div>
+
+              {editingRequestCell && (() => {
+                const nurse = activeNurses.find(n => n.id === editingRequestCell.nurseId);
+                const cur = monthRequests[String(editingRequestCell.nurseId)]?.[editingRequestCell.day] ?? null;
+                return (
+                  <ShiftPickerPopover
+                    title={`${nurse?.name} - ${editingRequestCell.day}日（希望）`}
+                    currentShift={cur}
+                    x={editingRequestCell.x}
+                    y={editingRequestCell.y}
+                    anchorTop={editingRequestCell.top}
+                    allShifts={allShifts}
+                    customShifts={customShifts}
+                    onSelect={(symbol) => applyRequestFromPalette(editingRequestCell.nurseId, editingRequestCell.day, symbol)}
+                    onClose={() => setEditingRequestCell(null)}
+                  />
+                );
+              })()}
 
               <div className="flex justify-end mt-4">
                 <button onClick={() => setShowRequestReview(false)} className="px-6 py-2 bg-gray-200 hover:bg-gray-300 rounded-xl transition-colors">
