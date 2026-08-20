@@ -2307,6 +2307,10 @@ const WardScheduleSystem = () => {
       prevMonthConstraints: cleansedPrevMonth,
       holidays: holidays.map(h => asInt(h - 1, 'floor', 'holiday', 0)),
       weekends: weekends.map(w => asInt(w, 'floor', 'weekend', 0)),
+      // 休診日。solver は closedDays を weekends と同じ 0-based 日インデックスとして扱うが、
+      // getClosedDays は 1-based の日番号を返すため -1 して送る（holidays と同じ変換）。
+      // solver 側は未送信・null なら空集合として扱うため、旧バージョンでも no-op。
+      closedDays: solverClosedDays.map(d => asInt(d - 1, 'floor', 'closedDay', 0)),
       numPatterns: 3,
     };
 
