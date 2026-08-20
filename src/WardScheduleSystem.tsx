@@ -1395,14 +1395,18 @@ const WardScheduleSystem = () => {
       });
       const dow = new Date(targetYear, targetMonth, d + 1).getDay();
       const isHolidayD = dow === 0 || dow === 6 || holidayListV.includes(d + 1);
-      const reqDay = isHolidayD ? cfgV.weekendDayStaff : cfgV.weekdayDayStaff;
+      // 休診日は外来の日勤枠が閉じるため必要人数 0。ソルバーへ送る closedDays と同じ扱いにする
+      // （solver.py: required = 0 if d in closed_days else ...）。closedDays は 1-based。
+      const reqDay = closedDays.includes(d + 1)
+        ? 0
+        : (isHolidayD ? cfgV.weekendDayStaff : cfgV.weekdayDayStaff);
       if (dayCount < reqDay) {
         v.push({ nurseId: -1, day: d, type: 'day_short', message: `日勤${dayCount}人（必要${reqDay}人）`, severity: 'warning' });
       }
     }
 
     return v;
-  }, [schedule, generateConfig, activeNurses, nurseShiftPrefs, nightNgPairs, prevMonthConstraints, daysInMonth, targetYear, targetMonth, allShifts]);
+  }, [schedule, generateConfig, activeNurses, nurseShiftPrefs, nightNgPairs, prevMonthConstraints, daysInMonth, targetYear, targetMonth, allShifts, closedDays]);
 
   const getViolationsForCell = (nurseId: number, day: number) => violations.filter(v => v.nurseId === nurseId && v.day === day);
   const getViolationsForNurse = (nurseId: number) => violations.filter(v => v.nurseId === nurseId && v.day === -1);
@@ -7187,11 +7191,16 @@ const WardScheduleSystem = () => {
                       const isNewYear = targetMonth === 0 && (day >= 1 && day <= 3);
                       const holidayListF = getJapaneseHolidays(targetYear, targetMonth);
                       const isNatHolF = holidayListF.includes(day);
-                      const minRequired = isYearEnd ? generateConfig.yearEndDayStaff :
+                      // 休診日は外来の日勤枠が閉じるため必要人数 0（ソルバーへ送る closedDays と同じ扱い）。
+                      // closedDays は 1-based なので day をそのまま照合する。
+                      const isClosedDayF = closedDays.includes(day);
+                      const minRequired = isClosedDayF ? 0 :
+                                          isYearEnd ? generateConfig.yearEndDayStaff :
                                           isNewYear ? generateConfig.newYearDayStaff :
                                           (isWeekend || isNatHolF) ? generateConfig.weekendDayStaff :
                                           generateConfig.weekdayDayStaff;
-                      const isStrictDay = isWeekend || isNatHolF || isYearEnd || isNewYear;
+                      // 休診日も厳密日として扱う。必要 0 なので日勤が1人でも入っていれば逸脱として強調する。
+                      const isStrictDay = isClosedDayF || isWeekend || isNatHolF || isYearEnd || isNewYear;
                       const isDeviation = isStrictDay
                         ? count !== minRequired
                         : (count < minRequired || count > minRequired + 2);
