@@ -118,6 +118,23 @@ const HALF_DAY_REQUEST_SHIFTS: Record<string, string> = {
   '午前半': '日',
   '午後半': '日',
 };
+
+// 欠勤の希望ラベル（U+6B20）。シフト種類管理の既定記号 '欠'（category:'off', hours:0）と同一。
+// SOLVER_APPLICABLE_SHIFTS に無いため solver.py の apply() が黙って捨て、
+// 欠勤希望のセルが自由変数になって日勤が入る（2026-09-09 の実データで確認）。
+const ABSENCE_REQUEST_LABEL = '欠';
+// ソルバーの公休ラベル。文字列は SOLVER_APPLICABLE_SHIFTS から現物を採取する。
+const SOLVER_OFF_LABEL = SOLVER_APPLICABLE_SHIFTS[5];  // '休'
+
+// ソルバー送信時の希望ラベル変換表（半休 + 欠勤）。
+// 半休 → '日'（日勤1名として送る）、欠勤 → '休'（公休として送る）。
+// いずれも生成結果の表示時に getRequestRestoreMap() で元のラベルへ復元する。
+// HALF_DAY_REQUEST_SHIFTS 自体は変更しない。SATURDAY_HALF_OFF_LABEL が
+// Object.keys(HALF_DAY_REQUEST_SHIFTS)[3] と位置で参照しているため。
+const SOLVER_REQUEST_CONVERSIONS: Record<string, string> = {
+  ...HALF_DAY_REQUEST_SHIFTS,
+  [ABSENCE_REQUEST_LABEL]: SOLVER_OFF_LABEL,
+};
 const sanitizeShift = (s: any): string | null => {
   if (!s) return null;
   const str = String(s).trim();
@@ -2219,8 +2236,9 @@ const WardScheduleSystem = () => {
     });
 
     // === 希望ラベルをソルバーが解釈できる形へ変換して送る ===
-    // 半休（前 / 後 / 午前半 / 午後半）は solver.py の apply() が処理できず黙って無視されるため、
-    // 「日勤1名」として '日' に変換して送信する。表示側では getHalfDayRestoreMap() で元に戻す。
+    // 半休（前 / 後 / 午前半 / 午後半）と欠勤（欠）は solver.py の apply() が処理できず
+    // 黙って無視されるため、半休は「日勤1名」として '日' に、欠勤は '休' に変換して送信する。
+    // 表示側では getRequestRestoreMap() で元に戻す。
     const requestData: Record<string, Record<string, string>> = {};
     const unknownLabels = new Set<string>();
     generationNurses.forEach(n => {
@@ -2229,7 +2247,7 @@ const WardScheduleSystem = () => {
       const converted: Record<string, string> = {};
       Object.entries(nr).forEach(([day, label]) => {
         const v = label as string;
-        const mapped = typeof v === 'string' ? HALF_DAY_REQUEST_SHIFTS[v] : undefined;
+        const mapped = typeof v === 'string' ? SOLVER_REQUEST_CONVERSIONS[v] : undefined;
         if (mapped) {
           converted[day] = mapped;
         } else {
@@ -2326,21 +2344,26 @@ const WardScheduleSystem = () => {
     return request;
   };
 
-  // 半休希望の復元マップ { nurseId: { 0-based日index: 元のラベル } }
-  // buildSolverRequest が '日' に変換して送った半休希望を、生成結果の表示時に元のラベルへ戻すために使う。
-  const getHalfDayRestoreMap = (): Record<string, Record<number, string>> => {
+  // 変換して送った希望の復元マップ { nurseId: { 0-based日index: { sent, label } } }
+  // buildSolverRequest が SOLVER_REQUEST_CONVERSIONS で変換して送った希望（半休→'日' /
+  // 欠勤→'休'）を、生成結果の表示時に元のラベルへ戻すために使う。
+  // sent は送信値。ソルバーが希望どおりその値を置いた場合にのみ復元するため保持する。
+  const getRequestRestoreMap = (): Record<string, Record<number, { sent: string; label: string }>> => {
     const monthKey = `${targetYear}-${targetMonth}`;
-    const map: Record<string, Record<number, string>> = {};
-    // 休診日は '休' で上書きして送っているため、半休ラベルへ戻してはならない
+    const map: Record<string, Record<number, { sent: string; label: string }>> = {};
     const closedDaySet = new Set(getClosedDays(targetYear, targetMonth, closedDaysConfig));
     Object.entries(requests[monthKey] || {}).forEach(([nid, days]: [string, any]) => {
       Object.entries(days || {}).forEach(([day, label]) => {
+        if (typeof label !== 'string') return;
+        const sent = SOLVER_REQUEST_CONVERSIONS[label];
+        if (!sent) return;
+        // 休診日は buildSolverRequest が全職員 '休' で上書きして送っている。
+        // 送信値が '休' 以外（半休の '日'）はその上書きに潰されているので復元してはならない。
+        // 欠勤は送信値が '休' で上書き後と同一のため、休診日でも '欠' へ復元する。
+        if (closedDaySet.has(Number(day)) && sent !== SOLVER_OFF_LABEL) return;
         // requests のキーは1-based、ソルバー結果の配列は0-based
-        if (closedDaySet.has(Number(day))) return;
-        if (typeof label === 'string' && HALF_DAY_REQUEST_SHIFTS[label]) {
-          if (!map[nid]) map[nid] = {};
-          map[nid][Number(day) - 1] = label;
-        }
+        if (!map[nid]) map[nid] = {};
+        map[nid][Number(day) - 1] = { sent, label };
       });
     });
     return map;
@@ -2405,18 +2428,19 @@ const WardScheduleSystem = () => {
 
         // API結果をフロントエンド形式に変換
         const excludedNurses = activeNurses.filter(n => nurseShiftPrefs[n.id]?.excludeFromGeneration);
-        // '日' として送った半休希望を元のラベル（前 / 後 / 午前半 / 午後半）へ復元する
-        const halfDayRestore = getHalfDayRestoreMap();
+        // 変換して送った希望を元のラベルへ復元する
+        // （半休: '日' → 前 / 後 / 午前半 / 午後半、欠勤: '休' → 欠）
+        const requestRestore = getRequestRestoreMap();
         const patterns = result.patterns.map((p: any, idx: number) => {
           const data: Record<number, string[]> = {};
           Object.entries(p.data).forEach(([nid, shifts]: [string, any]) => {
             const arr = Array.isArray(shifts) ? [...shifts] : shifts;
-            const restore = halfDayRestore[String(nid)];
+            const restore = requestRestore[String(nid)];
             if (restore && Array.isArray(arr)) {
-              Object.entries(restore).forEach(([dayIdx, label]) => {
+              Object.entries(restore).forEach(([dayIdx, entry]) => {
                 const i = Number(dayIdx);
-                // ソルバーが希望どおり日勤を置いた場合のみ復元する（他シフトは上書きしない）
-                if (i >= 0 && i < arr.length && arr[i] === '日') arr[i] = label;
+                // ソルバーが希望どおり送信値を置いた場合のみ復元する（他シフトは上書きしない）
+                if (i >= 0 && i < arr.length && arr[i] === entry.sent) arr[i] = entry.label;
               });
             }
             data[Number(nid)] = arr;
